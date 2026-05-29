@@ -776,3 +776,32 @@ fn test_zoom_excludes_hidden_panels_from_unfocused_dim() {
     grid.calculate_positions();
     assert_eq!(grid.unfocused_panels(focused).count(), 2);
 }
+
+/// Regression: when the top window margin grows (e.g. the tab bar
+/// becomes visible after a second tab is created), `update_scaled_margin`
+/// must refresh Taffy's root size. Otherwise the next layout pass uses
+/// the stale available area and the panel keeps its old height — leaving
+/// the bottom rows clipped behind the tab bar.
+#[test]
+fn test_update_scaled_margin_shrinks_panel_when_top_margin_grows() {
+    let mut grid = zoom_test_grid(1);
+    let panel = grid.current;
+
+    let initial_height = grid.inner[&panel].layout_rect[3];
+    assert!(
+        initial_height > 0.0,
+        "panel should have a positive initial height"
+    );
+
+    let tab_bar_height = 34.0;
+    grid.update_scaled_margin(Margin::new(tab_bar_height, 0.0, 0.0, 0.0));
+    grid.calculate_positions();
+
+    let new_height = grid.inner[&panel].layout_rect[3];
+    assert!(
+        (initial_height - new_height - tab_bar_height).abs() < 1.0,
+        "panel height should shrink by the new top margin: was {initial_height}, \
+         now {new_height}, expected ~{}",
+        initial_height - tab_bar_height
+    );
+}
