@@ -2697,18 +2697,20 @@ mod wght_rasterize_tests {
         let mut warm = GridGlyphRasterizer::new();
         warm.font_data_cache.insert(0, font_entry.clone());
         warm.wght_variation_cache.insert(0, Some(700.0));
-        let bold =
-            rasterize_glyph_native(&mut warm, 0, glyph_id, size_u16, false, false, false, &lib)
-                .expect("warm rasterize");
+        let bold = rasterize_glyph_native(
+            &mut warm, 0, glyph_id, size_u16, false, false, false, &lib,
+        )
+        .expect("warm rasterize");
 
         // Cold path: shaping was skipped (run-cache *hit*), so the side
         // cache has no entry for this font_id. This is the buggy case.
         let mut cold = GridGlyphRasterizer::new();
         cold.font_data_cache.insert(0, font_entry);
         // Intentionally leave `wght_variation_cache` empty.
-        let cold_glyph =
-            rasterize_glyph_native(&mut cold, 0, glyph_id, size_u16, false, false, false, &lib)
-                .expect("cold rasterize");
+        let cold_glyph = rasterize_glyph_native(
+            &mut cold, 0, glyph_id, size_u16, false, false, false, &lib,
+        )
+        .expect("cold rasterize");
 
         assert!(ink_mass(&bold) > 0, "reference glyph must have ink");
         assert_eq!(
@@ -2781,9 +2783,10 @@ mod wght_rasterize_tests {
         let mut clean = GridGlyphRasterizer::new();
         clean.font_data_cache.insert(1, plain_entry.clone());
         clean.wght_variation_cache.insert(1, None);
-        let plain_ref =
-            rasterize_glyph_native(&mut clean, 1, glyph_id, size_u16, false, false, false, &lib)
-                .expect("baseline rasterize");
+        let plain_ref = rasterize_glyph_native(
+            &mut clean, 1, glyph_id, size_u16, false, false, false, &lib,
+        )
+        .expect("baseline rasterize");
 
         // Leak path: rasterize the BOLD glyph first (seeds the shared
         // scale_ctx coords with wght 700), then the unweighted glyph through
@@ -2794,12 +2797,28 @@ mod wght_rasterize_tests {
         shared.wght_variation_cache.insert(0, Some(700.0));
         shared.font_data_cache.insert(1, plain_entry);
         shared.wght_variation_cache.insert(1, None);
-        let bold_first =
-            rasterize_glyph_native(&mut shared, 0, glyph_id, size_u16, false, false, false, &lib)
-                .expect("bold rasterize");
-        let plain_after =
-            rasterize_glyph_native(&mut shared, 1, glyph_id, size_u16, false, false, false, &lib)
-                .expect("post-bold unweighted rasterize");
+        let bold_first = rasterize_glyph_native(
+            &mut shared,
+            0,
+            glyph_id,
+            size_u16,
+            false,
+            false,
+            false,
+            &lib,
+        )
+        .expect("bold rasterize");
+        let plain_after = rasterize_glyph_native(
+            &mut shared,
+            1,
+            glyph_id,
+            size_u16,
+            false,
+            false,
+            false,
+            &lib,
+        )
+        .expect("post-bold unweighted rasterize");
 
         assert!(ink_mass(&plain_ref) > 0, "baseline glyph must have ink");
         // Sanity: bold really is heavier than the unweighted default, so the
@@ -2812,7 +2831,11 @@ mod wght_rasterize_tests {
             ink_mass(&plain_ref),
         );
         assert_eq!(
-            (plain_after.width, plain_after.height, ink_mass(&plain_after)),
+            (
+                plain_after.width,
+                plain_after.height,
+                ink_mass(&plain_after)
+            ),
             (plain_ref.width, plain_ref.height, ink_mass(&plain_ref)),
             "an unweighted (wght None) glyph must rasterize at the default \
              instance regardless of a preceding bold rasterize through the \
