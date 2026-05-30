@@ -1486,10 +1486,7 @@ impl Screen<'_> {
     }
 
     pub fn toggle_split_zoom(&mut self) {
-        if self
-            .context_manager
-            .toggle_split_zoom(&mut self.sugarloaf)
-        {
+        if self.context_manager.toggle_split_zoom(&mut self.sugarloaf) {
             self.resync_island_after_zoom();
             self.mark_dirty();
         }
@@ -2151,19 +2148,33 @@ impl Screen<'_> {
             return None;
         }
 
-        // Extract text from the line
-        let mut line_text = String::new();
-        for col in 0..grid.columns() {
-            let cell = &grid[point.row][rio_backend::crosswords::pos::Column(col)];
-            line_text.push(cell.c());
-        }
-        let line_text = line_text.trim_end();
+        // Extract text plus a byte→grid-column mapping so regex byte
+        // offsets translate back to the right cells when the line
+        // contains wide glyphs or multibyte codepoints. Without the
+        // mapping, `Column(byte_offset)` lands inside the URL when a
+        // wide glyph (emoji/CJK) precedes it, and the click target
+        // slides off the visible underline (see issue #1619).
+        let (line_text, byte_to_col) =
+            crate::hints::extract_line_text_with_cols(terminal, point.row);
 
         // Find all matches in this line and check if point is within any of them.
         // Onig yields (byte_start, byte_end); we slice the source ourselves.
-        for (start, end) in regex.find_iter(line_text) {
-            let start_col = rio_backend::crosswords::pos::Column(start);
-            let end_col = rio_backend::crosswords::pos::Column(end.saturating_sub(1));
+        for (start, end) in regex.find_iter(&line_text) {
+            if end == 0 || end > byte_to_col.len() {
+                continue;
+            }
+            let start_col_idx = byte_to_col[start];
+            let last_col_idx = byte_to_col[end - 1];
+            let end_col_idx = if grid[point.row]
+                [rio_backend::crosswords::pos::Column(last_col_idx)]
+            .is_wide()
+            {
+                last_col_idx + 1
+            } else {
+                last_col_idx
+            };
+            let start_col = rio_backend::crosswords::pos::Column(start_col_idx);
+            let end_col = rio_backend::crosswords::pos::Column(end_col_idx);
 
             // Check if the point is within this match
             if point.col >= start_col && point.col <= end_col {
@@ -2683,8 +2694,7 @@ impl Screen<'_> {
         let window_width = self.sugarloaf.window_size().width;
         let num_tabs = self.context_manager.len();
         let zoom = self.context_manager.current_pane_zoom();
-        let island_visible =
-            self.renderer.navigation.island_visible_with(num_tabs, zoom);
+        let island_visible = self.renderer.navigation.island_visible_with(num_tabs, zoom);
 
         // Check if the color picker is open and the click hits a swatch.
         // Handled before the `island_visible` short-circuit so a picker
