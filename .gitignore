@@ -10,6 +10,9 @@ target/
 .DS_Store
 rls/
 .vs
+
+# local git worktrees
+.trees/
 .vscode
 .swp
 release
