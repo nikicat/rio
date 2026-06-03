@@ -333,12 +333,19 @@ impl Text {
         if text.is_empty() {
             return 0.0;
         }
-        let Some(shaped) = self.shape_for(text, opts) else {
+        let runs = self.shape_runs(text, opts);
+        if runs.is_empty() {
             return 0.0;
-        };
-        let width_px = shaped_width(&shaped);
-        self.emit_instances(x, y, &shaped, opts);
-        width_px / self.scale_factor
+        }
+        let scale = self.scale_factor;
+        let mut pen_x = x * scale;
+        let py = y * scale;
+        let mut width_px = 0.0;
+        for run in &runs {
+            width_px += shaped_width(run);
+            pen_x = self.emit_run(pen_x, py, run, opts);
+        }
+        width_px / scale
     }
 
     /// Measure `text` under `opts` without recording a draw. Returns
@@ -347,26 +354,61 @@ impl Text {
         if text.is_empty() {
             return 0.0;
         }
-        self.shape_for(text, opts)
-            .map(|r| shaped_width(&r) / self.scale_factor)
-            .unwrap_or(0.0)
+        let width_px: f32 = self.shape_runs(text, opts).iter().map(shaped_width).sum();
+        width_px / self.scale_factor
     }
 
     //  Shape pipeline — shared cache + cfg-gated backend call
 
-    fn shape_for(&mut self, text: &str, opts: &DrawOpts) -> Option<ShapedRun> {
-        use crate::{Attributes, SpanStyle, Stretch, Style as FontStyle, Weight};
-
+    /// Resolve `text` into one or more shaped runs, splitting on font
+    /// boundaries so codepoints the primary font can't cover fall back
+    /// to a system font (emoji, CJK, symbols) instead of rendering as
+    /// `.notdef` tofu. Each returned run is shaped with a single font;
+    /// `draw` / `measure` lay them out left to right.
+    ///
+    /// When `opts.font_id` forces a specific face the caller wants that
+    /// exact font, so itemization is skipped and the whole string is
+    /// shaped as a single run — matching the pre-fallback behavior.
+    fn shape_runs(&mut self, text: &str, opts: &DrawOpts) -> Vec<ShapedRun> {
         let scaled = opts.font_size * self.scale_factor;
         let size_bucket = (scaled * 4.0).round().clamp(0.0, u16::MAX as f32) as u16;
         let size_u16 = scaled.round().clamp(1.0, u16::MAX as f32) as u16;
         let style_flags =
             (if opts.bold { 1u8 } else { 0 }) | (if opts.italic { 2u8 } else { 0 });
 
-        let first_ch = text.chars().next()?;
-        let (font_id, _is_emoji) = match self.font_resolve.entry((first_ch, style_flags))
-        {
-            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+        // Itemize into (font_id, byte-range) segments of consecutive
+        // chars that resolve to the same font. A forced font_id bypasses
+        // resolution and yields a single whole-string segment.
+        let segments: Vec<(u32, usize, usize)> = if let Some(forced) = opts.font_id {
+            vec![(forced as u32, 0, text.len())]
+        } else {
+            itemize_segments(text, |ch| self.resolve_char_font(ch, style_flags, opts))
+        };
+
+        let mut runs = Vec::with_capacity(segments.len());
+        for (font_id, start, end) in segments {
+            if let Some(run) = self.shape_segment(
+                font_id,
+                &text[start..end],
+                size_bucket,
+                size_u16,
+                style_flags,
+            ) {
+                runs.push(run);
+            }
+        }
+        runs
+    }
+
+    /// Resolve (and cache) the font that covers `ch` under the current
+    /// style. The fast path walks already-registered fonts; a miss
+    /// triggers platform cascade discovery (fontconfig / CoreText /
+    /// font-kit) and registers the discovered face, so later codepoints
+    /// in the same script land in the fast path.
+    fn resolve_char_font(&mut self, ch: char, style_flags: u8, opts: &DrawOpts) -> u32 {
+        use crate::{Attributes, SpanStyle, Stretch, Style as FontStyle, Weight};
+        match self.font_resolve.entry((ch, style_flags)) {
+            std::collections::hash_map::Entry::Occupied(e) => e.get().0,
             std::collections::hash_map::Entry::Vacant(e) => {
                 let mut ss = SpanStyle::default();
                 let weight = if opts.bold {
@@ -380,15 +422,24 @@ impl Text {
                     FontStyle::Normal
                 };
                 ss.font_attrs = Attributes::new(Stretch::NORMAL, weight, fstyle);
-                let resolved =
-                    self.font_library.resolve_font_for_char(first_ch, &ss, None);
+                let resolved = self.font_library.resolve_font_for_char(ch, &ss, None);
                 let v = (resolved.0 as u32, resolved.1);
                 e.insert(v);
-                v
+                v.0
             }
-        };
-        let font_id = opts.font_id.map(|id| id as u32).unwrap_or(font_id);
+        }
+    }
 
+    //  Shape one single-font segment — shared cache + cfg-gated backend.
+
+    fn shape_segment(
+        &mut self,
+        font_id: u32,
+        text: &str,
+        size_bucket: u16,
+        size_u16: u16,
+        style_flags: u8,
+    ) -> Option<ShapedRun> {
         let hash = shape_hash(font_id, size_bucket, style_flags, text);
         if let Some(entry) = self.shape_cache.get(&hash) {
             return Some(entry.clone());
@@ -531,10 +582,11 @@ impl Text {
 
     //  Emit pipeline — rasterize + push TextInstance
 
-    fn emit_instances(&mut self, x: f32, y: f32, run: &ShapedRun, opts: &DrawOpts) {
-        let scale = self.scale_factor;
-        let mut pen_x = x * scale;
-        let py = y * scale;
+    /// Emit GPU instances for one shaped run starting at device-space
+    /// pen `(pen_x, py)`. Returns the advanced `pen_x` so the caller can
+    /// chain multiple runs of a multi-font string left to right.
+    fn emit_run(&mut self, pen_x: f32, py: f32, run: &ShapedRun, opts: &DrawOpts) -> f32 {
+        let mut pen_x = pen_x;
         let color = opts.color;
 
         for glyph in &run.glyphs {
@@ -566,6 +618,7 @@ impl Text {
 
             pen_x += glyph.advance;
         }
+        pen_x
     }
 
     /// Lookup or rasterize-and-insert a glyph. Returns
@@ -1253,6 +1306,42 @@ impl Text {
 #[inline]
 fn shaped_width(run: &ShapedRun) -> f32 {
     run.glyphs.iter().map(|g| g.advance).sum()
+}
+
+/// Split `text` into maximal runs of consecutive chars that resolve to
+/// the same font id, returning `(font_id, start_byte, end_byte)` tuples
+/// whose ranges always fall on char boundaries and together cover the
+/// whole string. `resolve` maps each char to its font id.
+///
+/// This is the heart of the per-codepoint fallback fix: before it, the
+/// whole string was shaped with the *first* char's font, so anything the
+/// primary font didn't cover (emoji, CJK, symbols) rendered as `.notdef`
+/// tofu. Kept as a free function — independent of `FontLibrary` / GPU
+/// state — so the segmentation can be unit-tested with synthetic font
+/// ids (mirroring `island.rs`'s `fit_title_with_widths`).
+fn itemize_segments(
+    text: &str,
+    mut resolve: impl FnMut(char) -> u32,
+) -> Vec<(u32, usize, usize)> {
+    let mut segments: Vec<(u32, usize, usize)> = Vec::new();
+    let mut seg_start = 0usize;
+    let mut cur_font: Option<u32> = None;
+    for (idx, ch) in text.char_indices() {
+        let fid = resolve(ch);
+        match cur_font {
+            Some(f) if f == fid => {}
+            Some(f) => {
+                segments.push((f, seg_start, idx));
+                seg_start = idx;
+                cur_font = Some(fid);
+            }
+            None => cur_font = Some(fid),
+        }
+    }
+    if let Some(f) = cur_font {
+        segments.push((f, seg_start, text.len()));
+    }
+    segments
 }
 
 #[cfg(all(feature = "wgpu", not(target_os = "macos")))]
@@ -2113,5 +2202,97 @@ fn blit_text_color(
             let idx = buf_row + (dst_x as usize);
             buf[idx] = blend_premul_over(src, buf[idx]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::itemize_segments;
+
+    /// Reassemble the original string from segment byte-ranges. Also
+    /// implicitly checks that every (start, end) is a valid char
+    /// boundary — `&text[start..end]` panics otherwise.
+    fn reassemble(text: &str, segs: &[(u32, usize, usize)]) -> String {
+        segs.iter().map(|&(_, s, e)| &text[s..e]).collect()
+    }
+
+    /// Resolve by Unicode range, standing in for the real font cascade:
+    /// ASCII → font 0 (primary), CJK → 1, everything else (emoji,
+    /// symbols) → 2. Deterministic, so the test never depends on which
+    /// fallback fonts the host has installed.
+    fn by_block(ch: char) -> u32 {
+        match ch {
+            c if c.is_ascii() => 0,
+            '\u{4E00}'..='\u{9FFF}' => 1,
+            _ => 2,
+        }
+    }
+
+    #[test]
+    fn empty_string_yields_no_segments() {
+        assert!(itemize_segments("", by_block).is_empty());
+    }
+
+    #[test]
+    fn single_font_is_one_segment() {
+        let text = "hello world";
+        let segs = itemize_segments(text, by_block);
+        assert_eq!(segs, vec![(0, 0, text.len())]);
+    }
+
+    /// The regression itself: before the fix the whole string was shaped
+    /// with the *first* char's font, so non-primary codepoints rendered
+    /// as tofu. Itemization must split so each codepoint group gets its
+    /// own font — proven here by the first char's font (0) NOT covering
+    /// the whole string.
+    #[test]
+    fn mixed_fonts_split_so_first_char_font_is_not_applied_to_whole_string() {
+        let text = "hello 😀 你★";
+        let segs = itemize_segments(text, by_block);
+
+        // More than one run, and the first run does not span the string.
+        assert!(segs.len() > 1, "expected multiple segments, got {segs:?}");
+        assert_ne!(segs[0].2, text.len(), "first font swallowed whole string");
+
+        // Distinct fonts actually used (primary + emoji + CJK).
+        let mut fonts: Vec<u32> = segs.iter().map(|s| s.0).collect();
+        fonts.sort_unstable();
+        fonts.dedup();
+        assert!(fonts.contains(&0) && fonts.contains(&1) && fonts.contains(&2));
+
+        // Coverage + char-boundary integrity.
+        assert_eq!(reassemble(text, &segs), text);
+    }
+
+    #[test]
+    fn consecutive_same_font_chars_coalesce() {
+        // "ab你好cd" → [ascii "ab", cjk "你好", ascii "cd"] = 3 runs,
+        // not 6 — adjacent same-font chars must merge.
+        let text = "ab你好cd";
+        let segs = itemize_segments(text, by_block);
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0, 1, 0]);
+        assert_eq!(reassemble(text, &segs), text);
+    }
+
+    #[test]
+    fn multibyte_ranges_stay_on_char_boundaries() {
+        // Astral emoji (4 bytes) flanked by ASCII: ranges must land on
+        // char boundaries and cover the whole string.
+        let text = "a😀b";
+        let segs = itemize_segments(text, by_block);
+        assert_eq!(reassemble(text, &segs), text);
+        for &(_, s, e) in &segs {
+            assert!(text.is_char_boundary(s) && text.is_char_boundary(e));
+        }
+    }
+
+    #[test]
+    fn alternating_fonts_produce_one_segment_each() {
+        // a(0) 你(1) b(0) 好(1) → 4 distinct runs.
+        let text = "a你b好";
+        let segs = itemize_segments(text, by_block);
+        assert_eq!(segs.len(), 4);
+        assert_eq!(reassemble(text, &segs), text);
     }
 }

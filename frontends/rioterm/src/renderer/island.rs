@@ -42,12 +42,14 @@ const TAB_PADDING_X: f32 = 24.0;
 
 /// Glyph shown at the left of a tab whose grid has a maximized (zoomed)
 /// pane, mirroring Ghostty's tab zoom indicator. This is the Nerd Font
-/// `nf-fa-search` magnifier (U+F002): the UI text layer can't render the
-/// astral emoji 🔍 (U+1F50D), and plain BMP symbols like ⌕ (U+2315) need
-/// on-demand fontconfig fallback that the tab bar's read-only font
-/// resolution doesn't trigger. U+F002 lives in the bundled Nerd-patched
-/// CascadiaCodeNF, so the resolver picks that font for this glyph and it
-/// always renders. Monochrome, so it also takes the tab text color.
+/// `nf-fa-search` magnifier (U+F002), preferred over the astral emoji
+/// 🔍 (U+1F50D) or a plain BMP symbol like ⌕ (U+2315) for two reasons:
+/// it's monochrome (so it takes the tab text color rather than rendering
+/// as a fixed-color emoji), and it lives in the bundled CascadiaCodeNF
+/// (so it renders without depending on a system fallback font being
+/// installed). The UI text layer does itemize per-codepoint and fall
+/// back via fontconfig now, but a bundled monochrome glyph is the
+/// dependable choice for a UI affordance.
 const ZOOM_INDICATOR: &str = "\u{f002}";
 
 /// Inset from the tab's left edge to the zoom indicator.
@@ -56,9 +58,9 @@ const ZOOM_INDICATOR_PADDING_X: f32 = 8.0;
 /// Dot shown at the right of a tab that has an unanswered bell (`BEL` rang in
 /// one of its panes while that pane was unfocused), cleared when the pane is
 /// focused. Like [`ZOOM_INDICATOR`] this is a bundled Nerd Font glyph
-/// (`nf-fa-circle`, U+F111) so the tab bar's read-only font resolution always
-/// renders it — a plain BMP dot like ● (U+25CF) would need fontconfig fallback
-/// that doesn't trigger here. Monochrome, so it takes the configured bell color.
+/// (`nf-fa-circle`, U+F111): monochrome so it takes the configured bell color,
+/// and bundled in CascadiaCodeNF so it renders without relying on a system
+/// fallback font being present.
 const BELL_INDICATOR: &str = "\u{f111}";
 
 /// Inset from the tab's right edge to the bell dot. Sits in the right padding
