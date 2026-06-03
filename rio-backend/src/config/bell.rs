@@ -16,6 +16,26 @@ pub struct Bell {
     /// sound, the urgency hint and the notification alike.
     #[serde(default = "default_min_interval", rename = "min-interval")]
     pub min_interval: u64,
+    /// Mark a background (non-active) tab that received a bell with a colored
+    /// dot in the tab bar, cleared when that tab is focused. The per-tab
+    /// counterpart to the window urgency hint. Accepts a bool or
+    /// `"on"`/`"off"`.
+    #[serde(default = "default_tab_highlight", rename = "tab-highlight")]
+    pub tab_highlight: TabHighlight,
+}
+
+/// Whether a bell in a background tab marks that tab in the tab bar until it is
+/// focused. Accepts a bool or `"on"`/`"off"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabHighlight {
+    Disabled,
+    Enabled,
+}
+
+impl TabHighlight {
+    pub fn is_enabled(self) -> bool {
+        matches!(self, TabHighlight::Enabled)
+    }
 }
 
 /// How the audible bell behaves.
@@ -70,6 +90,7 @@ impl Default for Bell {
             urgency: default_urgency(),
             notification: default_notification(),
             min_interval: default_min_interval(),
+            tab_highlight: default_tab_highlight(),
         }
     }
 }
@@ -103,6 +124,12 @@ fn default_urgency() -> UrgencyHint {
 
 fn default_notification() -> BellNotification {
     BellNotification::Disabled
+}
+
+fn default_tab_highlight() -> TabHighlight {
+    // On by default: an unobtrusive dot that only appears on a background tab
+    // that rang, matching the standard behavior of Ghostty/kitty/iTerm2.
+    TabHighlight::Enabled
 }
 
 fn default_min_interval() -> u64 {
@@ -188,6 +215,28 @@ impl Serialize for BellNotification {
     }
 }
 
+impl<'de> Deserialize<'de> for TabHighlight {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(if toggle_from(deserializer)? {
+            TabHighlight::Enabled
+        } else {
+            TabHighlight::Disabled
+        })
+    }
+}
+
+impl Serialize for TabHighlight {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bool(self.is_enabled())
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum BoolOrStr {
@@ -244,6 +293,8 @@ mod tests {
         assert!(!parse("urgency = false").urgency.is_enabled());
         assert!(parse("notification = \"on\"").notification.is_enabled());
         assert!(!parse("notification = \"off\"").notification.is_enabled());
+        assert!(parse("tab-highlight = true").tab_highlight.is_enabled());
+        assert!(!parse("tab-highlight = \"off\"").tab_highlight.is_enabled());
     }
 
     #[test]
@@ -260,6 +311,7 @@ mod tests {
             assert!(!bell.urgency.is_enabled());
         }
         assert!(!bell.notification.is_enabled());
+        assert!(bell.tab_highlight.is_enabled());
     }
 
     #[test]
@@ -281,6 +333,7 @@ mod tests {
             urgency: UrgencyHint::Enabled,
             notification: BellNotification::Disabled,
             min_interval: 3_000,
+            tab_highlight: TabHighlight::Enabled,
         };
         let serialized = toml::to_string(&bell).unwrap();
         assert_eq!(toml::from_str::<Bell>(&serialized).unwrap(), bell);

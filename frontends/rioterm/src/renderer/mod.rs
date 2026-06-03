@@ -117,7 +117,9 @@ impl Renderer {
                 named_colors.tabs,
                 named_colors.tabs_active,
                 named_colors.tab_border,
+                named_colors.tab_bell,
                 config.navigation.hide_if_single,
+                config.bell.tab_highlight.is_enabled(),
             ))
         } else {
             None

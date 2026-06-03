@@ -510,6 +510,8 @@ impl Screen<'_> {
                 config.colors.tabs,
                 config.colors.tabs_active,
                 config.colors.tab_border,
+                config.colors.tab_bell,
+                config.bell.tab_highlight.is_enabled(),
             );
             self.renderer.island = Some(island);
         }

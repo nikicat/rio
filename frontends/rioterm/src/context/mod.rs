@@ -397,9 +397,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             }
         }
 
+        // Keep `current_route` in sync with the focused pane from the start —
+        // see the note in `start_with_capacity`.
+        let current_route = initial_context.route_id;
+
         Ok(ContextManager {
             current_index: 0,
-            current_route: 0,
+            current_route,
             contexts: smallvec![ContextGrid::new(
                 initial_context,
                 scaled_margin,
@@ -446,9 +450,15 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
         let titles = ContextManagerTitles::new(0, String::new(), None);
 
+        // `current_route` must track the focused pane's `route_id` from the
+        // start (route IDs are counter-allocated from 1, never 0), otherwise
+        // focused-pane checks like the bell marker misfire until the first
+        // tab/split switch resyncs it.
+        let current_route = initial_context.route_id;
+
         Ok(ContextManager {
             current_index: 0,
-            current_route: 0,
+            current_route,
             contexts: smallvec![ContextGrid::new(
                 initial_context,
                 Margin::default(),
@@ -591,19 +601,19 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn select_next_split(&mut self) {
         self.contexts[self.current_index].select_next_split();
-        self.current_route = self.current().route_id;
+        self.focus_current_pane();
     }
 
     #[inline]
     pub fn select_prev_split(&mut self) {
         self.contexts[self.current_index].select_prev_split();
-        self.current_route = self.current().route_id;
+        self.focus_current_pane();
     }
 
     #[inline]
     pub fn switch_to_next_split_or_tab(&mut self) {
         if self.contexts[self.current_index].select_next_split_no_loop() {
-            self.current_route = self.current().route_id;
+            self.focus_current_pane();
             return;
         }
         self.switch_to_next();
@@ -612,13 +622,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if let Some(root) = current_tab.root {
             current_tab.current = root;
         }
-        self.current_route = self.current().route_id;
+        self.focus_current_pane();
     }
 
     #[inline]
     pub fn switch_to_prev_split_or_tab(&mut self) {
         if self.contexts[self.current_index].select_prev_split_no_loop() {
-            self.current_route = self.current().route_id;
+            self.focus_current_pane();
             return;
         }
         self.switch_to_prev();
@@ -628,7 +638,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if let Some(&last_key) = ordered_keys.last() {
             current_tab.current = last_key;
         }
-        self.current_route = self.current().route_id;
+        self.focus_current_pane();
     }
 
     #[inline]
@@ -716,7 +726,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn select_route_from_current_grid(&mut self) {
-        self.current_route = self.current().route_id;
+        self.focus_current_pane();
     }
 
     #[inline]
@@ -809,7 +819,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn remove_current_grid(&mut self, sugarloaf: &mut Sugarloaf) {
         self.contexts[self.current_index].remove_current(sugarloaf);
-        self.current_route = self.contexts[self.current_index].current().route_id;
+        self.focus_current_pane();
     }
 
     #[inline]
@@ -829,6 +839,45 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.contexts
             .get(index)
             .is_some_and(|grid| grid.is_zoomed())
+    }
+
+    /// Flag the pane with `route_id` as having an unanswered bell, unless it is
+    /// the currently focused pane (the bell is acknowledged the instant it
+    /// rings under focus). The flag is stored per-pane so a future per-pane
+    /// highlight can reuse it; today the tab bar consumes the per-tab OR of it
+    /// via [`Self::tab_has_bell`]. Returns whether a pane was newly flagged, so
+    /// the caller only forces a tab-bar redraw when something changed.
+    #[inline]
+    pub fn mark_bell(&mut self, route_id: usize) -> bool {
+        if route_id == self.current_route {
+            return false;
+        }
+        self.contexts
+            .iter_mut()
+            .find_map(|grid| {
+                grid.contains_route(route_id)
+                    .then(|| grid.set_bell_for_route(route_id))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether the tab at `index` has an unanswered bell on any of its panes.
+    #[inline]
+    pub fn tab_has_bell(&self, index: usize) -> bool {
+        self.contexts.get(index).is_some_and(|grid| grid.has_bell())
+    }
+
+    /// Focus the current pane: record it as the active route and acknowledge
+    /// its bell. Every tab/split switch funnels its `current_route` update
+    /// through here, so focusing the exact pane that rang clears its dot
+    /// (without disturbing belled siblings).
+    #[inline]
+    fn focus_current_pane(&mut self) {
+        self.current_route = self.current().route_id;
+        let route = self.current_route;
+        if let Some(grid) = self.contexts.get_mut(self.current_index) {
+            grid.clear_bell_for_route(route);
+        }
     }
 
     /// Zoom state of the current grid, as the named [`PaneZoom`] the
@@ -862,7 +911,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     pub fn set_current(&mut self, context_id: usize) {
         if context_id < self.contexts.len() {
             self.current_index = context_id;
-            self.current_route = self.current().route_id;
+            self.focus_current_pane();
         }
     }
 
@@ -933,7 +982,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.current_index += 1;
         }
 
-        self.current_route = self.current().route_id;
+        self.focus_current_pane();
     }
 
     #[inline]
@@ -950,7 +999,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.current_index -= 1;
         }
 
-        self.current_route = self.current().route_id;
+        self.focus_current_pane();
     }
 
     #[inline]
@@ -1170,7 +1219,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     ));
                     if redirect {
                         self.current_index = last_index;
-                        self.current_route = self.current().route_id;
+                        self.focus_current_pane();
                     }
                 }
                 Err(..) => {
@@ -1327,6 +1376,38 @@ pub mod test {
 
         assert_eq!(context_manager.len(), 3);
         assert_eq!(context_manager.capacity, 3);
+    }
+
+    #[test]
+    fn test_bell_marks_background_tab_and_clears_on_focus() {
+        let window_id: WindowId = WindowId::from(0);
+        let mut cm =
+            ContextManager::start_with_capacity(5, VoidListener {}, window_id).unwrap();
+        // Two extra background tabs; `should_redirect = false` keeps tab 0 active.
+        cm.add_context(false, 0);
+        cm.add_context(false, 0);
+        assert_eq!(cm.current_index, 0);
+        assert_eq!(cm.len(), 3);
+
+        let tab0_route = cm.contexts[0].current().route_id;
+        let tab1_route = cm.contexts[1].current().route_id;
+
+        // A bell in a background tab flags it (returns "newly flagged").
+        assert!(cm.mark_bell(tab1_route));
+        assert!(cm.tab_has_bell(1));
+        assert!(!cm.tab_has_bell(0));
+        assert!(!cm.tab_has_bell(2));
+
+        // Re-ringing the same already-flagged pane is a no-op (no redraw).
+        assert!(!cm.mark_bell(tab1_route));
+
+        // A bell in the focused pane is acknowledged the instant it rings.
+        assert!(!cm.mark_bell(tab0_route));
+        assert!(!cm.tab_has_bell(0));
+
+        // Focusing the flagged tab clears its dot.
+        cm.set_current(1);
+        assert!(!cm.tab_has_bell(1));
     }
 
     #[test]

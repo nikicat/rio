@@ -59,6 +59,14 @@ pub fn tab_border() -> ColorArray {
 }
 
 #[inline]
+pub fn tab_bell() -> ColorArray {
+    // Yellow "unread" dot on a background tab that rang the bell.
+    ColorBuilder::from_hex(String::from("#FCBA28"), Format::SRGB0_1)
+        .unwrap()
+        .to_arr()
+}
+
+#[inline]
 pub fn foreground() -> ColorArray {
     [1., 1., 1., 1.]
 }

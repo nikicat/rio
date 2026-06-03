@@ -3223,7 +3223,8 @@ impl<U: EventListener> Handler for Crosswords<U> {
             return;
         }
         self.last_bell = Some(now);
-        self.event_proxy.send_event(RioEvent::Bell, self.window_id);
+        self.event_proxy
+            .send_event(RioEvent::Bell(self.route_id), self.window_id);
     }
 
     #[inline]
@@ -4602,7 +4603,7 @@ mod tests {
         }
 
         fn send_event(&self, event: RioEvent, _id: crate::event::WindowId) {
-            if matches!(event, RioEvent::Bell) {
+            if matches!(event, RioEvent::Bell(_)) {
                 self.bells.set(self.bells.get() + 1);
             }
         }

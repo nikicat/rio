@@ -93,7 +93,7 @@ impl Application<'_> {
         )
     }
 
-    fn handle_bell(&mut self, window_id: WindowId) {
+    fn handle_bell(&mut self, window_id: WindowId, route_id: usize) {
         tracing::debug!("bell fired: audio={:?}", self.config.bell.audio);
 
         // Playback always runs on the bell worker thread, never the window
@@ -102,15 +102,29 @@ impl Application<'_> {
         // only ever sees the occasional bell.
         crate::bell::ring(self.config.bell.audio);
 
+        let Some(route) = self.router.routes.get_mut(&window_id) else {
+            return;
+        };
+
+        // Per-tab bell dot: flag the (background) pane that rang so the tab bar
+        // marks its tab until that pane is focused. Only repaint when the marker
+        // is newly set — a bell on the focused pane changes nothing. The marker
+        // lives in the tab bar, not in any terminal panel, so without
+        // `mark_dirty` here `render()` would discard the frame as "nothing
+        // changed" and the dot wouldn't appear until the next panel damage
+        // (e.g. the user interacting with an app).
+        if self.config.bell.tab_highlight.is_enabled()
+            && route.window.screen.ctx_mut().mark_bell(route_id)
+        {
+            route.window.screen.mark_dirty();
+            route.request_redraw();
+        }
+
         let urgency = self.config.bell.urgency.is_enabled();
         let notify = self.config.bell.notification.is_enabled();
         if !urgency && !notify {
             return;
         }
-
-        let Some(route) = self.router.routes.get(&window_id) else {
-            return;
-        };
         // Urgency and notifications only matter when the window is unfocused;
         // that is the case where a background bell would otherwise be missed.
         if route.window.is_focused {
@@ -546,8 +560,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     route.request_redraw();
                 }
             }
-            RioEventType::Rio(RioEvent::Bell) => {
-                self.handle_bell(window_id);
+            RioEventType::Rio(RioEvent::Bell(route_id)) => {
+                self.handle_bell(window_id, route_id);
             }
             RioEventType::Rio(RioEvent::DesktopNotification { title, body }) => {
                 self.handle_desktop_notification(&title, &body);

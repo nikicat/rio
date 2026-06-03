@@ -130,6 +130,10 @@ pub struct ContextGrid<T: EventListener> {
 pub struct ContextGridItem<T: EventListener> {
     pub val: Context<T>,
     pub layout_rect: [f32; 4],
+    /// Set when this panel rang the bell while it was not the focused pane;
+    /// cleared when this exact pane is focused. The tab bar's per-tab bell dot
+    /// is the OR of these flags across the tab's panes.
+    pub bell_ringing: bool,
 }
 
 impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
@@ -137,6 +141,7 @@ impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
         Self {
             val: context,
             layout_rect: [0.0; 4],
+            bell_ringing: false,
         }
     }
 
@@ -270,6 +275,46 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         self.inner
             .values_mut()
             .find(|item| item.val.route_id == route_id)
+    }
+
+    /// Whether any panel in this grid carries a `route_id` — used to find
+    /// which tab a backend `route_id` belongs to without a mutable borrow.
+    #[inline]
+    pub fn contains_route(&self, route_id: usize) -> bool {
+        self.inner
+            .values()
+            .any(|item| item.val.route_id == route_id)
+    }
+
+    /// Flag the panel with `route_id` as having rung the bell. Returns whether
+    /// a panel was found and newly flagged (so the caller can skip a redraw
+    /// when nothing changed).
+    #[inline]
+    pub fn set_bell_for_route(&mut self, route_id: usize) -> bool {
+        if let Some(item) = self.get_by_route_id(route_id) {
+            if !item.bell_ringing {
+                item.bell_ringing = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether any panel in this grid has an unanswered bell. The per-tab
+    /// representation (tab-bar dot) is the OR of the per-panel flags.
+    #[inline]
+    pub fn has_bell(&self) -> bool {
+        self.inner.values().any(|item| item.bell_ringing)
+    }
+
+    /// Clear the bell flag on the single panel with `route_id`. Called when
+    /// that exact pane is focused, so acknowledging one split doesn't dismiss
+    /// the bell on its siblings.
+    #[inline]
+    pub fn clear_bell_for_route(&mut self, route_id: usize) {
+        if let Some(item) = self.get_by_route_id(route_id) {
+            item.bell_ringing = false;
+        }
     }
 
     #[inline]

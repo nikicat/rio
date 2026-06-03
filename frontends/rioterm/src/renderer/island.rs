@@ -53,6 +53,19 @@ const ZOOM_INDICATOR: &str = "\u{f002}";
 /// Inset from the tab's left edge to the zoom indicator.
 const ZOOM_INDICATOR_PADDING_X: f32 = 8.0;
 
+/// Dot shown at the right of a tab that has an unanswered bell (`BEL` rang in
+/// one of its panes while that pane was unfocused), cleared when the pane is
+/// focused. Like [`ZOOM_INDICATOR`] this is a bundled Nerd Font glyph
+/// (`nf-fa-circle`, U+F111) so the tab bar's read-only font resolution always
+/// renders it — a plain BMP dot like ● (U+25CF) would need fontconfig fallback
+/// that doesn't trigger here. Monochrome, so it takes the configured bell color.
+const BELL_INDICATOR: &str = "\u{f111}";
+
+/// Inset from the tab's right edge to the bell dot. Sits in the right padding
+/// zone the centered, ellipsis-truncated title always leaves clear, so the dot
+/// never collides with the title text.
+const BELL_INDICATOR_PADDING_X: f32 = 8.0;
+
 /// Suffix used when truncating a title that doesn't fit in its tab.
 const TITLE_ELLIPSIS: char = '…';
 
@@ -152,6 +165,10 @@ pub struct Island {
     pub inactive_text_color: [f32; 4],
     pub active_text_color: [f32; 4],
     pub border_color: [f32; 4],
+    /// Whether to draw the per-tab bell dot (`bell.tab-highlight`).
+    pub tab_highlight: bool,
+    /// Color of the bell dot (`colors.tab-bell`).
+    pub bell_color: [f32; 4],
     /// Current progress bar state
     progress_state: Option<ProgressState>,
     /// Current progress value (0-100)
@@ -185,13 +202,17 @@ impl Island {
         inactive_text_color: [f32; 4],
         active_text_color: [f32; 4],
         border_color: [f32; 4],
+        bell_color: [f32; 4],
         hide_if_single: bool,
+        tab_highlight: bool,
     ) -> Self {
         Self {
             hide_if_single,
             inactive_text_color,
             active_text_color,
             border_color,
+            tab_highlight,
+            bell_color,
             progress_state: None,
             progress_value: None,
             progress_started_at: None,
@@ -213,10 +234,14 @@ impl Island {
         inactive_text_color: [f32; 4],
         active_text_color: [f32; 4],
         border_color: [f32; 4],
+        bell_color: [f32; 4],
+        tab_highlight: bool,
     ) {
         self.inactive_text_color = inactive_text_color;
         self.active_text_color = active_text_color;
         self.border_color = border_color;
+        self.bell_color = bell_color;
+        self.tab_highlight = tab_highlight;
     }
 
     /// Update the progress bar state from an OSC 9;4 report.
@@ -448,6 +473,25 @@ impl Island {
                     text_y,
                     ZOOM_INDICATOR,
                     &title_opts,
+                );
+            }
+
+            // Bell dot: right-aligned in the tab's right padding (mirroring the
+            // left zoom glyph) so it never collides with the centered, possibly
+            // ellipsis-truncated title. Right-aligned because its own advance
+            // varies with the font.
+            if self.tab_highlight && context_manager.tab_has_bell(tab_index) {
+                let bell_opts = DrawOpts {
+                    font_size: TITLE_FONT_SIZE,
+                    color: color_u8(self.bell_color),
+                    ..DrawOpts::default()
+                };
+                let dot_width = ui.measure(BELL_INDICATOR, &bell_opts);
+                ui.draw(
+                    x_position + tab_width - BELL_INDICATOR_PADDING_X - dot_width,
+                    text_y,
+                    BELL_INDICATOR,
+                    &bell_opts,
                 );
             }
 
@@ -930,12 +974,22 @@ mod tests {
         let active_color = [0.9, 0.9, 0.9, 1.0];
         let border_color = [0.7, 0.7, 0.7, 1.0];
 
-        let island = Island::new(inactive_color, active_color, border_color, true);
+        let bell_color = [1.0, 0.7, 0.1, 1.0];
+        let island = Island::new(
+            inactive_color,
+            active_color,
+            border_color,
+            bell_color,
+            true,
+            true,
+        );
 
         assert_eq!(island.inactive_text_color, inactive_color);
         assert_eq!(island.active_text_color, active_color);
         assert_eq!(island.border_color, border_color);
+        assert_eq!(island.bell_color, bell_color);
         assert!(island.hide_if_single);
+        assert!(island.tab_highlight);
     }
 
     #[test]
@@ -944,7 +998,9 @@ mod tests {
             [0.8, 0.8, 0.8, 1.0],
             [1.0, 1.0, 1.0, 1.0],
             [0.8, 0.8, 0.8, 1.0],
+            [1.0, 0.7, 0.1, 1.0],
             false,
+            true,
         );
         assert_eq!(island.height(), ISLAND_HEIGHT);
     }
@@ -954,7 +1010,9 @@ mod tests {
             [0.5, 0.5, 0.5, 1.0],
             [0.9, 0.9, 0.9, 1.0],
             [0.7, 0.7, 0.7, 1.0],
+            [1.0, 0.7, 0.1, 1.0],
             false,
+            true,
         )
     }
 
