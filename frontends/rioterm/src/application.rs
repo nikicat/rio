@@ -1,7 +1,7 @@
 use crate::event::{ClickState, EventPayload, EventProxy, RioEvent, RioEventType};
 use crate::ime::Preedit;
 use crate::renderer::utils::update_colors_based_on_theme;
-use crate::router::{routes::RoutePath, Router};
+use crate::router::{routes::RoutePath, Route, Router};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::screen::touch::on_touch;
 use crate::watcher::configuration_file_updates;
@@ -23,6 +23,271 @@ use rio_window::window::WindowId;
 use rio_window::window::{ActivationToken, CursorIcon, Fullscreen, UserAttentionType};
 use std::error::Error;
 use std::time::{Duration, Instant};
+
+/// The branch a left mouse-button press takes once the pre-empting click
+/// handlers (resize border, island, scrollbar, search, palette, assistant)
+/// have all declined it. Computed by [`classify_left_press`] so the routing
+/// — including the rule that begins a fresh selection when a click moves
+/// focus to another pane — is unit-testable without driving the full winit
+/// event loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftPressAction {
+    /// The press landed on a *different* pane and moved focus there. Panel
+    /// switching wins over mouse reporting (e.g. neovim grabbing clicks), and
+    /// the press must begin a fresh selection on the newly focused pane — see
+    /// the doc on [`classify_left_press`].
+    StartSelection,
+    /// A mouse-reporting application owns the press (no Shift held, mouse mode
+    /// active). Forward it as an SGR/X10 report instead of selecting.
+    MouseReport,
+    /// An ordinary terminal press: try to follow a hyperlink under the cursor,
+    /// otherwise start/extend a selection per the click state.
+    Normal,
+}
+
+/// Decide how a left press is handled, given whether it switched the focused
+/// pane, whether Shift is held, and whether the focused terminal has mouse
+/// reporting on.
+///
+/// The `StartSelection` result when `switched_pane` is true is the fix for the
+/// stale-selection bug: clicking pane B, then click-dragging back on pane A,
+/// refocuses A via this path. Without starting a fresh selection here, A still
+/// carries the selection it had before focus left it, so the drag's
+/// `update_selection` extends that stale selection (its end marker chases the
+/// mouse) instead of beginning a new one at the click point.
+fn classify_left_press(
+    switched_pane: bool,
+    shift_pressed: bool,
+    mouse_mode: bool,
+) -> LeftPressAction {
+    if switched_pane {
+        LeftPressAction::StartSelection
+    } else if !shift_pressed && mouse_mode {
+        LeftPressAction::MouseReport
+    } else {
+        LeftPressAction::Normal
+    }
+}
+
+/// Handle a mouse-button *press* on a terminal route: double/triple-click
+/// bookkeeping, the pre-empting UI click handlers (resize border, assistant,
+/// palette, search, island, scrollbar), then the pane-switch / mouse-report /
+/// normal-click routing decided by [`classify_left_press`].
+fn handle_mouse_press(
+    route: &mut Route<'_>,
+    clipboard: &mut Clipboard,
+    button: MouseButton,
+) {
+    // Calculate time since the last click to handle double/triple clicks.
+    // Do this early so island clicks can use the click state.
+    let now = Instant::now();
+    let elapsed = now - route.window.screen.mouse.last_click_timestamp;
+    route.window.screen.mouse.last_click_timestamp = now;
+
+    let threshold = Duration::from_millis(300);
+    let mouse = &route.window.screen.mouse;
+    route.window.screen.mouse.click_state = match mouse.click_state {
+        // Reset click state if button has changed.
+        _ if button != mouse.last_click_button => {
+            route.window.screen.mouse.last_click_button = button;
+            ClickState::Click
+        }
+        ClickState::Click if elapsed < threshold => ClickState::DoubleClick,
+        ClickState::DoubleClick if elapsed < threshold => ClickState::TripleClick,
+        _ => ClickState::Click,
+    };
+
+    if let MouseButton::Left = button {
+        // Check if clicking on a panel border to start resize.
+        {
+            let mx = route.window.screen.mouse.x as f32;
+            let my = route.window.screen.mouse.y as f32;
+            let grid = route.window.screen.context_manager.current_grid();
+            if let Some(border) = grid.find_border_at_position(mx, my) {
+                let start_pos = match border.direction {
+                    crate::layout::BorderDirection::Vertical => mx,
+                    crate::layout::BorderDirection::Horizontal => my,
+                };
+                let size_a = grid.get_panel_size(border.left_or_top, border.direction);
+                let size_b =
+                    grid.get_panel_size(border.right_or_bottom, border.direction);
+                route.window.screen.resize_state = Some(crate::layout::ResizeState {
+                    border,
+                    start_pos,
+                    original_sizes: (size_a, size_b),
+                });
+                return;
+            }
+        }
+
+        if route.window.screen.handle_assistant_click() {
+            route.request_redraw();
+            return;
+        }
+
+        if route.window.screen.handle_palette_click(clipboard) {
+            route.request_redraw();
+            return;
+        }
+
+        if route.window.screen.handle_search_click(clipboard) {
+            route.request_redraw();
+            return;
+        }
+
+        let handled_by_island = route.window.screen.handle_island_click(
+            &route.window.winit_window,
+            clipboard,
+            false,
+        );
+
+        if handled_by_island {
+            // Island handled the click, don't process further.
+            route.request_redraw();
+            return;
+        }
+
+        if route.window.screen.handle_scrollbar_click() {
+            route.request_redraw();
+            return;
+        }
+    } else if let MouseButton::Right = button {
+        let handled_by_island = route.window.screen.handle_island_click(
+            &route.window.winit_window,
+            clipboard,
+            true,
+        );
+
+        if handled_by_island {
+            route.request_redraw();
+            return;
+        }
+    }
+
+    // Always try panel switching first: if the click targets a different
+    // panel, switch to it regardless of mouse mode (e.g. neovim capturing
+    // clicks).
+    let switched_pane = route.window.screen.select_current_based_on_mouse();
+    let shift_pressed = route.window.screen.modifiers.state().shift_key();
+    let mouse_mode = route.window.screen.mouse_mode();
+    match classify_left_press(switched_pane, shift_pressed, mouse_mode) {
+        LeftPressAction::StartSelection => {
+            // A click that switches panes must also begin a fresh selection on
+            // the newly focused pane, just like a normal click does. Otherwise
+            // a stale selection left over on that pane survives, and the
+            // subsequent drag extends it instead of starting a new one.
+            if let MouseButton::Left = button {
+                let display_offset = route.window.screen.display_offset();
+                let pos = route.window.screen.mouse_position(display_offset);
+                route.window.screen.on_left_click(pos, clipboard);
+            }
+            route.request_redraw();
+        }
+        LeftPressAction::MouseReport => {
+            // Process mouse press before bindings to update the `click_state`.
+            route.window.screen.mouse.click_state = ClickState::None;
+
+            let code = match button {
+                MouseButton::Left => 0,
+                MouseButton::Middle => 1,
+                MouseButton::Right => 2,
+                // Can't properly report more than three buttons..
+                MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => {
+                    return
+                }
+            };
+
+            route
+                .window
+                .screen
+                .mouse_report(code, ElementState::Pressed);
+            route
+                .window
+                .screen
+                .process_mouse_bindings(button, clipboard);
+        }
+        LeftPressAction::Normal => {
+            if route.window.screen.trigger_hyperlink() {
+                return;
+            }
+
+            // Load mouse point, treating message bar and padding as the
+            // closest square.
+            let display_offset = route.window.screen.display_offset();
+
+            if let MouseButton::Left = button {
+                let pos = route.window.screen.mouse_position(display_offset);
+                route.window.screen.on_left_click(pos, clipboard);
+            }
+
+            route.request_redraw();
+        }
+    }
+    route
+        .window
+        .screen
+        .process_mouse_bindings(button, clipboard);
+}
+
+/// Handle a mouse-button *release* on a terminal route: stop selection
+/// auto-scroll, finish scrollbar/border drags, emit a release mouse report
+/// when an application owns the pointer, trigger a highlighted hint, or copy
+/// the finished selection to the primary clipboard.
+fn handle_mouse_release(
+    route: &mut Route<'_>,
+    clipboard: &mut Clipboard,
+    scheduler: &mut Scheduler,
+    copy_on_select: bool,
+    button: MouseButton,
+) {
+    // Stop selection auto-scroll on button release.
+    if let MouseButton::Left | MouseButton::Right = button {
+        let scroll_timer_id = route.window.screen.ctx().current_route();
+        let timer_id = TimerId::new(Topic::SelectionScrolling, scroll_timer_id);
+        scheduler.unschedule(timer_id);
+    }
+
+    if route.window.screen.renderer.scrollbar.is_dragging() {
+        route.window.screen.handle_scrollbar_release();
+        route.request_redraw();
+        return;
+    }
+
+    if route.window.screen.resize_state.is_some() {
+        route.window.screen.resize_state = None;
+        route.window.winit_window.set_cursor(CursorIcon::Default);
+        return;
+    }
+
+    if !route.window.screen.modifiers.state().shift_key()
+        && route.window.screen.mouse_mode()
+    {
+        let code = match button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            // Can't properly report more than three buttons.
+            MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => return,
+        };
+        route
+            .window
+            .screen
+            .mouse_report(code, ElementState::Released);
+        return;
+    }
+
+    // Trigger hints highlighted by the mouse.
+    if button == MouseButton::Left && route.window.screen.trigger_hint(clipboard) {
+        return;
+    }
+
+    if let MouseButton::Left | MouseButton::Right = button {
+        route
+            .window
+            .screen
+            .copy_selection_on_pointer_release(copy_on_select, clipboard);
+    }
+}
 
 pub struct Application<'a> {
     config: rio_backend::config::Config,
@@ -1063,227 +1328,15 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
                 match state {
                     ElementState::Pressed => {
-                        // Calculate time since the last click to handle double/triple clicks.
-                        // Do this early so island clicks can use the click state
-                        let now = Instant::now();
-                        let elapsed =
-                            now - route.window.screen.mouse.last_click_timestamp;
-                        route.window.screen.mouse.last_click_timestamp = now;
-
-                        let threshold = Duration::from_millis(300);
-                        let mouse = &route.window.screen.mouse;
-                        route.window.screen.mouse.click_state = match mouse.click_state {
-                            // Reset click state if button has changed.
-                            _ if button != mouse.last_click_button => {
-                                route.window.screen.mouse.last_click_button = button;
-                                ClickState::Click
-                            }
-                            ClickState::Click if elapsed < threshold => {
-                                ClickState::DoubleClick
-                            }
-                            ClickState::DoubleClick if elapsed < threshold => {
-                                ClickState::TripleClick
-                            }
-                            _ => ClickState::Click,
-                        };
-
-                        if let MouseButton::Left = button {
-                            // Check if clicking on a panel border to start resize
-                            {
-                                let mx = route.window.screen.mouse.x as f32;
-                                let my = route.window.screen.mouse.y as f32;
-                                let grid =
-                                    route.window.screen.context_manager.current_grid();
-                                if let Some(border) = grid.find_border_at_position(mx, my)
-                                {
-                                    let start_pos = match border.direction {
-                                        crate::layout::BorderDirection::Vertical => mx,
-                                        crate::layout::BorderDirection::Horizontal => my,
-                                    };
-                                    let size_a = grid.get_panel_size(
-                                        border.left_or_top,
-                                        border.direction,
-                                    );
-                                    let size_b = grid.get_panel_size(
-                                        border.right_or_bottom,
-                                        border.direction,
-                                    );
-                                    route.window.screen.resize_state =
-                                        Some(crate::layout::ResizeState {
-                                            border,
-                                            start_pos,
-                                            original_sizes: (size_a, size_b),
-                                        });
-                                    return;
-                                }
-                            }
-
-                            if route.window.screen.handle_assistant_click() {
-                                route.request_redraw();
-                                return;
-                            }
-
-                            if route
-                                .window
-                                .screen
-                                .handle_palette_click(&mut self.router.clipboard)
-                            {
-                                route.request_redraw();
-                                return;
-                            }
-
-                            if route
-                                .window
-                                .screen
-                                .handle_search_click(&mut self.router.clipboard)
-                            {
-                                route.request_redraw();
-                                return;
-                            }
-
-                            let handled_by_island =
-                                route.window.screen.handle_island_click(
-                                    &route.window.winit_window,
-                                    &mut self.router.clipboard,
-                                    false,
-                                );
-
-                            if handled_by_island {
-                                // Island handled the click, don't process further
-                                route.request_redraw();
-                                return;
-                            }
-
-                            if route.window.screen.handle_scrollbar_click() {
-                                route.request_redraw();
-                                return;
-                            }
-                        } else if let MouseButton::Right = button {
-                            let handled_by_island =
-                                route.window.screen.handle_island_click(
-                                    &route.window.winit_window,
-                                    &mut self.router.clipboard,
-                                    true,
-                                );
-
-                            if handled_by_island {
-                                route.request_redraw();
-                                return;
-                            }
-                        }
-
-                        // Always try panel switching first: if the click
-                        // targets a different panel, switch to it regardless
-                        // of mouse mode (e.g. neovim capturing clicks).
-                        if route.window.screen.select_current_based_on_mouse() {
-                            route.request_redraw();
-                        } else if !route.window.screen.modifiers.state().shift_key()
-                            && route.window.screen.mouse_mode()
-                        {
-                            // Process mouse press before bindings to update the `click_state`.
-                            route.window.screen.mouse.click_state = ClickState::None;
-
-                            let code = match button {
-                                MouseButton::Left => 0,
-                                MouseButton::Middle => 1,
-                                MouseButton::Right => 2,
-                                // Can't properly report more than three buttons..
-                                MouseButton::Back
-                                | MouseButton::Forward
-                                | MouseButton::Other(_) => return,
-                            };
-
-                            route
-                                .window
-                                .screen
-                                .mouse_report(code, ElementState::Pressed);
-
-                            route.window.screen.process_mouse_bindings(
-                                button,
-                                &mut self.router.clipboard,
-                            );
-                        } else {
-                            if route.window.screen.trigger_hyperlink() {
-                                return;
-                            }
-
-                            // Load mouse point, treating message bar and padding as the closest square.
-                            let display_offset = route.window.screen.display_offset();
-
-                            if let MouseButton::Left = button {
-                                let pos =
-                                    route.window.screen.mouse_position(display_offset);
-                                route
-                                    .window
-                                    .screen
-                                    .on_left_click(pos, &mut self.router.clipboard);
-                            }
-
-                            route.request_redraw();
-                        }
-                        route
-                            .window
-                            .screen
-                            .process_mouse_bindings(button, &mut self.router.clipboard);
+                        handle_mouse_press(route, &mut self.router.clipboard, button)
                     }
-                    ElementState::Released => {
-                        // Stop selection auto-scroll on button release.
-                        if let MouseButton::Left | MouseButton::Right = button {
-                            let scroll_timer_id =
-                                route.window.screen.ctx().current_route();
-                            let timer_id =
-                                TimerId::new(Topic::SelectionScrolling, scroll_timer_id);
-                            self.scheduler.unschedule(timer_id);
-                        }
-
-                        if route.window.screen.renderer.scrollbar.is_dragging() {
-                            route.window.screen.handle_scrollbar_release();
-                            route.request_redraw();
-                            return;
-                        }
-
-                        if route.window.screen.resize_state.is_some() {
-                            route.window.screen.resize_state = None;
-                            route.window.winit_window.set_cursor(CursorIcon::Default);
-                            return;
-                        }
-
-                        if !route.window.screen.modifiers.state().shift_key()
-                            && route.window.screen.mouse_mode()
-                        {
-                            let code = match button {
-                                MouseButton::Left => 0,
-                                MouseButton::Middle => 1,
-                                MouseButton::Right => 2,
-                                // Can't properly report more than three buttons.
-                                MouseButton::Back
-                                | MouseButton::Forward
-                                | MouseButton::Other(_) => return,
-                            };
-                            route
-                                .window
-                                .screen
-                                .mouse_report(code, ElementState::Released);
-                            return;
-                        }
-
-                        // Trigger hints highlighted by the mouse
-                        if button == MouseButton::Left
-                            && route
-                                .window
-                                .screen
-                                .trigger_hint(&mut self.router.clipboard)
-                        {
-                            return;
-                        }
-
-                        if let MouseButton::Left | MouseButton::Right = button {
-                            route.window.screen.copy_selection_on_pointer_release(
-                                self.config.copy_on_select,
-                                &mut self.router.clipboard,
-                            );
-                        }
-                    }
+                    ElementState::Released => handle_mouse_release(
+                        route,
+                        &mut self.router.clipboard,
+                        &mut self.scheduler,
+                        self.config.copy_on_select,
+                        button,
+                    ),
                 }
             }
 
@@ -1981,5 +2034,61 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
         self.router.clipboard = Clipboard::new_nop();
 
         std::process::exit(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_left_press, LeftPressAction};
+
+    /// Regression: clicking pane B, then click-dragging back on pane A, must
+    /// start a *fresh* selection on A rather than extending the selection A
+    /// still held from before focus moved away. The drag's `update_selection`
+    /// only extends an existing selection, so the refocusing press has to be
+    /// the one that resets it — hence a pane-switching left press routes to
+    /// `StartSelection`.
+    #[test]
+    fn pane_switch_press_starts_fresh_selection() {
+        // A press that moved focus to another pane begins a new selection,
+        // and panel switching wins over mouse mode and Shift.
+        for &shift in &[false, true] {
+            for &mouse_mode in &[false, true] {
+                assert_eq!(
+                    classify_left_press(true, shift, mouse_mode),
+                    LeftPressAction::StartSelection,
+                    "switched_pane press must start a selection \
+                     (shift={shift}, mouse_mode={mouse_mode})",
+                );
+            }
+        }
+    }
+
+    /// Without a pane switch, an application in mouse mode owns the press —
+    /// unless Shift is held, which is the user's override to select locally.
+    #[test]
+    fn mouse_mode_routes_to_report_unless_shift() {
+        assert_eq!(
+            classify_left_press(false, false, true),
+            LeftPressAction::MouseReport,
+        );
+        assert_eq!(
+            classify_left_press(false, true, true),
+            LeftPressAction::Normal,
+            "Shift overrides mouse mode so the user can select",
+        );
+    }
+
+    /// A plain press on the focused pane with no mouse-mode app is an ordinary
+    /// click (hyperlink, then start/extend selection).
+    #[test]
+    fn plain_press_is_normal() {
+        assert_eq!(
+            classify_left_press(false, false, false),
+            LeftPressAction::Normal,
+        );
+        assert_eq!(
+            classify_left_press(false, true, false),
+            LeftPressAction::Normal,
+        );
     }
 }
