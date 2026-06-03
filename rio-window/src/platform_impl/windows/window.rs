@@ -1125,6 +1125,13 @@ impl Window {
         }
     }
 
+    /// Windows focuses via `SetForegroundWindow`, not activation tokens, so
+    /// this ignores the token and falls back to a plain focus request.
+    #[inline]
+    pub fn activate_token(&self, _token: String) {
+        self.focus_window();
+    }
+
     #[inline]
     pub fn focus_window(&self) {
         let window_flags = self.window_state_lock().window_flags();

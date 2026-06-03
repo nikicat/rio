@@ -568,6 +568,20 @@ impl Window {
         xdg_activation_token.commit();
     }
 
+    /// Activate (raise + focus) this window using an xdg-activation token
+    /// obtained out of band — e.g. the token a notification daemon hands out in
+    /// its `ActivationToken` D-Bus signal when the user clicks a notification.
+    /// Unlike [`Self::focus_window`] (a no-op on Wayland, where a client cannot
+    /// focus itself unprompted), a valid token authorizes the compositor to
+    /// honor the request.
+    pub fn activate_token(&self, token: String) {
+        let Some(xdg_activation) = self.xdg_activation.as_ref() else {
+            warn!("`activate_token` isn't supported");
+            return;
+        };
+        xdg_activation.activate(token, self.surface());
+    }
+
     pub fn request_activation_token(
         &self,
     ) -> Result<AsyncRequestSerial, NotSupportedError> {

@@ -1862,6 +1862,13 @@ impl WindowDelegate {
     #[inline]
     pub fn set_ime_purpose(&self, _purpose: ImePurpose) {}
 
+    /// macOS focuses via `NSApplication`, not activation tokens, so this
+    /// ignores the token and falls back to a plain focus request.
+    #[inline]
+    pub fn activate_token(&self, _token: String) {
+        self.focus_window();
+    }
+
     #[inline]
     pub fn focus_window(&self) {
         let mtm = MainThreadMarker::from(self);

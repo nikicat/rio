@@ -387,6 +387,11 @@ impl Window {
     pub fn focus_window(&self) {}
 
     #[inline]
+    pub fn activate_token(&self, _token: String) {
+        self.focus_window();
+    }
+
+    #[inline]
     pub fn request_user_attention(
         &self,
         _request_type: Option<window::UserAttentionType>,

@@ -1388,6 +1388,24 @@ impl Window {
         self.window.maybe_queue_on_main(|w| w.focus_window())
     }
 
+    /// Activate (raise + focus) this window using an out-of-band activation
+    /// token, such as the one a notification daemon emits in its
+    /// `ActivationToken` signal when the user clicks a notification.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **Wayland:** activates the surface via `xdg-activation` with the token
+    ///   — the only way a client may focus itself, since [`Self::focus_window`]
+    ///   is a no-op there.
+    /// - **Other platforms:** the token is ignored and this falls back to
+    ///   [`Self::focus_window`].
+    #[inline]
+    pub fn activate_token(&self, token: ActivationToken) {
+        let _span = tracing::debug_span!("rio_window::Window::activate_token",).entered();
+        let token = token.into_raw();
+        self.window.maybe_queue_on_main(move |w| w.activate_token(token))
+    }
+
     /// Gets whether the window has keyboard focus.
     ///
     /// This queries the same state information as [`WindowEvent::Focused`].
@@ -1912,5 +1930,17 @@ pub struct ActivationToken {
 impl ActivationToken {
     pub(crate) fn _new(_token: String) -> Self {
         Self { _token }
+    }
+
+    /// Wrap a raw token string, e.g. one received out of band from a
+    /// notification daemon's `ActivationToken` signal, for use with
+    /// [`Window::activate_token`].
+    pub fn from_raw(token: String) -> Self {
+        Self { _token: token }
+    }
+
+    /// The underlying token string.
+    pub fn into_raw(self) -> String {
+        self._token
     }
 }

@@ -553,6 +553,11 @@ impl Window {
         x11_or_wayland!(match self; Window(w) => w.focus_window())
     }
 
+    #[inline]
+    pub fn activate_token(&self, token: String) {
+        x11_or_wayland!(match self; Window(w) => w.activate_token(token))
+    }
+
     pub fn request_user_attention(&self, request_type: Option<UserAttentionType>) {
         x11_or_wayland!(match self; Window(w) => w.request_user_attention(request_type))
     }

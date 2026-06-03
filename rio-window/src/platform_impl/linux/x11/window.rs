@@ -1914,6 +1914,14 @@ impl UnownedWindow {
     #[inline]
     pub fn set_ime_purpose(&self, _purpose: ImePurpose) {}
 
+    /// X11 has no per-click activation token to consume (focus stealing is
+    /// governed by timestamps, not tokens), so activation collapses to a plain
+    /// focus request.
+    #[inline]
+    pub fn activate_token(&self, _token: String) {
+        self.focus_window();
+    }
+
     #[inline]
     pub fn focus_window(&self) {
         let atoms = self.xconn.atoms();

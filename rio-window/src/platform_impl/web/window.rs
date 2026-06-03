@@ -387,6 +387,13 @@ impl Inner {
         let _ = self.canvas.borrow().raw().focus();
     }
 
+    /// The web backend has no activation token; this falls back to focusing the
+    /// canvas.
+    #[inline]
+    pub fn activate_token(&self, _token: String) {
+        self.focus_window();
+    }
+
     #[inline]
     pub fn request_user_attention(&self, _request_type: Option<UserAttentionType>) {
         // Currently an intentional no-op
