@@ -82,11 +82,7 @@ mod platform {
 
     // TODO: wire `_on_activate` through a `UNUserNotificationCenterDelegate`
     // so clicking the notification raises the right tab on macOS too.
-    pub fn notify(
-        title: &str,
-        body: &str,
-        _on_activate: Option<super::ActivateHandler>,
-    ) {
+    pub fn notify(title: &str, body: &str, _on_activate: Option<super::ActivateHandler>) {
         unsafe {
             // UNUserNotificationCenter crashes if the app has no bundle
             // identifier (e.g. cargo run). Guard like Kitty does.
@@ -147,7 +143,11 @@ mod platform {
             let _: Result<u32, _> = proxy.call(
                 "Notify",
                 &(
-                    "Rio", 0u32, "rio", title, body,
+                    "Rio",
+                    0u32,
+                    "rio",
+                    title,
+                    body,
                     &[] as &[&str], // actions
                     &hints,
                     -1i32, // expire_timeout
@@ -161,10 +161,21 @@ mod platform {
         // rule being installed. If we can't subscribe, fall back to a plain
         // notification rather than dropping it.
         let Some(mut signals) = subscribe(&connection) else {
-            tracing::warn!("notifier: could not subscribe to daemon signals; fire-and-forget");
+            tracing::warn!(
+                "notifier: could not subscribe to daemon signals; fire-and-forget"
+            );
             let _: Result<u32, _> = proxy.call(
                 "Notify",
-                &("Rio", 0u32, "rio", title, body, &[] as &[&str], &hints, -1i32),
+                &(
+                    "Rio",
+                    0u32,
+                    "rio",
+                    title,
+                    body,
+                    &[] as &[&str],
+                    &hints,
+                    -1i32,
+                ),
             );
             return;
         };
@@ -175,7 +186,11 @@ mod platform {
         let id: u32 = match proxy.call(
             "Notify",
             &(
-                "Rio", 0u32, "rio", title, body,
+                "Rio",
+                0u32,
+                "rio",
+                title,
+                body,
                 &["default", "Open"] as &[&str],
                 &hints,
                 -1i32,
@@ -199,21 +214,19 @@ mod platform {
         for msg in signals.by_ref() {
             let Ok(msg) = msg else { continue };
             let header = msg.header();
-            let Some(member) = header.member() else { continue };
+            let Some(member) = header.member() else {
+                continue;
+            };
             match member.as_str() {
                 "ActivationToken" => {
-                    if let Ok((nid, token)) =
-                        msg.body().deserialize::<(u32, String)>()
-                    {
+                    if let Ok((nid, token)) = msg.body().deserialize::<(u32, String)>() {
                         if nid == id {
                             pending_token = Some(token);
                         }
                     }
                 }
                 "ActionInvoked" => {
-                    if let Ok((nid, action)) =
-                        msg.body().deserialize::<(u32, String)>()
-                    {
+                    if let Ok((nid, action)) = msg.body().deserialize::<(u32, String)>() {
                         if nid == id && action == "default" {
                             on_activate(pending_token.take());
                             return;
@@ -221,9 +234,7 @@ mod platform {
                     }
                 }
                 "NotificationClosed" => {
-                    if let Ok((nid, _reason)) =
-                        msg.body().deserialize::<(u32, u32)>()
-                    {
+                    if let Ok((nid, _reason)) = msg.body().deserialize::<(u32, u32)>() {
                         if nid == id {
                             return;
                         }
@@ -254,11 +265,7 @@ mod platform {
 #[cfg(target_os = "windows")]
 mod platform {
     // TODO: handle toast activation so a click raises the right tab on Windows.
-    pub fn notify(
-        title: &str,
-        body: &str,
-        _on_activate: Option<super::ActivateHandler>,
-    ) {
+    pub fn notify(title: &str, body: &str, _on_activate: Option<super::ActivateHandler>) {
         use windows::core::HSTRING;
         use windows::Data::Xml::Dom::XmlDocument;
         use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};

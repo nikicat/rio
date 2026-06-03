@@ -1403,7 +1403,8 @@ impl Window {
     pub fn activate_token(&self, token: ActivationToken) {
         let _span = tracing::debug_span!("rio_window::Window::activate_token",).entered();
         let token = token.into_raw();
-        self.window.maybe_queue_on_main(move |w| w.activate_token(token))
+        self.window
+            .maybe_queue_on_main(move |w| w.activate_token(token))
     }
 
     /// Gets whether the window has keyboard focus.
