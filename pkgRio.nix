@@ -66,7 +66,12 @@ in
         ]
         ++ (map (x: ./. + "/${x}") cargoToml.workspace.members));
     };
-    cargoLock.lockFile = ./Cargo.lock;
+    cargoLock = {
+      lockFile = ./Cargo.lock;
+      outputHashes = {
+        "sctk-adwaita-0.10.1" = "sha256-t2SSTL2hQQ9WHORpPIbHEt+A2akTjD7CLuS0hsCd9qk=";
+      };
+    };
 
     cargoBuildFlags = "-p rioterm";
 
