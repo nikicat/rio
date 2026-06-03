@@ -192,6 +192,21 @@ pub enum RioEvent {
     /// the frontend can mark the originating (possibly background) tab.
     Bell(usize),
 
+    /// A desktop notification was clicked/activated. Carries the `route_id`
+    /// of the panel that posted it; the frontend raises that window and
+    /// switches to the tab containing that pane. Delivered from the
+    /// notifier's background thread via the event proxy, so the click lands
+    /// on the exact tab that rang rather than just raising the window.
+    ///
+    /// `activation_token` is the xdg-activation token the notification daemon
+    /// supplies alongside the click (Wayland), used to raise the window past
+    /// the compositor's focus-stealing prevention. `None` when the platform or
+    /// daemon doesn't provide one.
+    ActivateRoute {
+        route_id: usize,
+        activation_token: Option<rio_window::window::ActivationToken>,
+    },
+
     /// Desktop notification from OSC 9 or OSC 777.
     DesktopNotification {
         title: String,
@@ -274,6 +289,9 @@ impl Debug for RioEvent {
             }
             RioEvent::Scroll(scroll) => write!(f, "Scroll {scroll:?}"),
             RioEvent::Bell(_) => write!(f, "Bell"),
+            RioEvent::ActivateRoute { route_id, .. } => {
+                write!(f, "ActivateRoute({route_id})")
+            }
             RioEvent::DesktopNotification { title, body } => {
                 write!(f, "DesktopNotification({title}, {body})")
             }

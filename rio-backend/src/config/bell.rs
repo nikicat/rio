@@ -109,21 +109,23 @@ fn default_audio() -> AudioBell {
 }
 
 fn default_urgency() -> UrgencyHint {
-    // The window urgency / attention hint is the primary reason a bell is
-    // useful on Linux (taskbar/dock flash when unfocused). Leave the existing
-    // macOS/Windows behavior untouched.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    {
-        UrgencyHint::Disabled
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        UrgencyHint::Enabled
-    }
+    // Off by default: the desktop notification (see `default_notification`) is
+    // the canonical "you have an unfocused bell" signal now, and it carries a
+    // click-to-tab action the urgency hint cannot. On GNOME the urgency hint is
+    // delivered via xdg-activation, which the shell renders as its own "Rio is
+    // ready" banner — so leaving both on would pop two banners per bell. Users
+    // who prefer a persistent taskbar/dock highlight can opt back in.
+    UrgencyHint::Disabled
 }
 
 fn default_notification() -> BellNotification {
-    BellNotification::Disabled
+    // On by default: a bell in an unfocused window raises a desktop
+    // notification; clicking it raises that window and switches to the tab that
+    // rang. A bell in the focused window stays silent (just the tab dot). This
+    // matches how kitty/iTerm2/etc. behave. Requires a notification daemon
+    // (every mainstream desktop ships one); bare WMs without one can fall back
+    // to the urgency hint above.
+    BellNotification::Enabled
 }
 
 fn default_tab_highlight() -> TabHighlight {
@@ -303,14 +305,16 @@ mod tests {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             assert_eq!(bell.audio, AudioBell::System);
-            assert!(bell.urgency.is_enabled());
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             assert_eq!(bell.audio, AudioBell::Beep);
-            assert!(!bell.urgency.is_enabled());
         }
-        assert!(!bell.notification.is_enabled());
+        // The desktop notification is the canonical unfocused-bell signal on
+        // every platform; the urgency hint is off by default (see the
+        // rationale on `default_urgency`).
+        assert!(!bell.urgency.is_enabled());
+        assert!(bell.notification.is_enabled());
         assert!(bell.tab_highlight.is_enabled());
     }
 
