@@ -672,6 +672,24 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.set_current(tab_index);
     }
 
+    /// Switch to the tab whose grid contains `route_id`, focusing that pane
+    /// (which also acknowledges its bell). Returns whether a matching tab was
+    /// found — the route may have closed between posting a notification and
+    /// the user clicking it. Used to land a clicked bell notification on the
+    /// exact tab that rang.
+    #[inline]
+    pub fn select_tab_by_route(&mut self, route_id: usize) -> bool {
+        let Some(index) = self
+            .contexts
+            .iter()
+            .position(|grid| grid.contains_route(route_id))
+        else {
+            return false;
+        };
+        self.select_tab(index);
+        true
+    }
+
     #[inline]
     pub fn toggle_full_screen(&mut self) {
         self.event_proxy

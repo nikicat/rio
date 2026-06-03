@@ -20,7 +20,7 @@ use rio_window::platform::macos::ActiveEventLoopExtMacOS;
 #[cfg(target_os = "macos")]
 use rio_window::platform::macos::WindowExtMacOS;
 use rio_window::window::WindowId;
-use rio_window::window::{CursorIcon, Fullscreen, UserAttentionType};
+use rio_window::window::{ActivationToken, CursorIcon, Fullscreen, UserAttentionType};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
@@ -141,12 +141,25 @@ impl Application<'_> {
         if notify {
             let title = route.window.screen.ctx().current_title();
             let title = if title.is_empty() { "Rio" } else { &title };
-            self.handle_desktop_notification(title, "Terminal bell");
+            // Clicking the notification should land on the tab that rang, not
+            // just raise the window. Hand the notifier a callback that posts
+            // ActivateRoute back to this window from its background thread.
+            let proxy = self.event_proxy.clone();
+            let on_activate = Box::new(move |token: Option<String>| {
+                proxy.send_event(
+                    RioEventType::Rio(RioEvent::ActivateRoute {
+                        route_id,
+                        activation_token: token.map(ActivationToken::from_raw),
+                    }),
+                    window_id,
+                );
+            });
+            rio_notifier::send_notification(title, "Terminal bell", Some(on_activate));
         }
     }
 
     fn handle_desktop_notification(&self, title: &str, body: &str) {
-        rio_notifier::send_notification(title, body);
+        rio_notifier::send_notification(title, body, None);
     }
 
     pub fn run(
@@ -562,6 +575,31 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
             RioEventType::Rio(RioEvent::Bell(route_id)) => {
                 self.handle_bell(window_id, route_id);
+            }
+            RioEventType::Rio(RioEvent::ActivateRoute {
+                route_id,
+                activation_token,
+            }) => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    // Raise the window. On Wayland focus_window is a no-op, so a
+                    // token from the notification click is the only way to win
+                    // the compositor's focus-stealing check; elsewhere
+                    // activate_token falls back to focus_window.
+                    match activation_token {
+                        Some(token) => route.window.winit_window.activate_token(token),
+                        None => route.window.winit_window.focus_window(),
+                    }
+                    if route.window.screen.ctx_mut().select_tab_by_route(route_id) {
+                        route.window.screen.mark_dirty();
+                        route.request_redraw();
+                    } else {
+                        tracing::warn!(
+                            "ActivateRoute: no tab contains route {route_id} (closed?)"
+                        );
+                    }
+                } else {
+                    tracing::warn!("ActivateRoute: no route for window {window_id:?}");
+                }
             }
             RioEventType::Rio(RioEvent::DesktopNotification { title, body }) => {
                 self.handle_desktop_notification(&title, &body);
