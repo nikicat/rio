@@ -40,7 +40,7 @@ jobs:
         run: sudo apt-get update -yq && sudo apt-get install -yq libasound2-dev libfontconfig1-dev glslang-tools
       - run: cargo fetch
       - run: cargo fmt -- --check --color always
-      - run: cargo clippy --all-targets --all-features
+      - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --features wgpu
   msys2-build-test: #cargo test doesn't necessarily build the exec we want
     strategy:
