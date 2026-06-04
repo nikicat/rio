@@ -1,0 +1,113 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# OSS GoReleaser config for x86_64 Linux fork builds. Runs on a native
+# ubuntu-x64 runner and appends its artifacts to the tag's GitHub release;
+# the aarch64 runner uses .goreleaser.arm64.yaml in parallel.
+version: 2
+
+report_sizes: true
+
+env:
+  - CARGO_TERM_COLOR=always
+  - RUST_BACKTRACE=full
+
+before:
+  hooks:
+    # Generates misc/r/rio, referenced by the rpm terminfo content below.
+    - tic -xe rio -o misc misc/rio.terminfo
+
+builds:
+  - id: linux-x64-wayland
+    builder: rust
+    command: build
+    flags: [--release, -p=rioterm, --no-default-features, --features=wayland]
+    env:
+      - CARGO_PROFILE_RELEASE_OPT_LEVEL=s
+    targets: [x86_64-unknown-linux-gnu]
+
+  - id: linux-x64-x11
+    builder: rust
+    command: build
+    flags: [--release, -p=rioterm, --no-default-features, --features=x11]
+    env:
+      - CARGO_PROFILE_RELEASE_OPT_LEVEL=s
+    targets: [x86_64-unknown-linux-gnu]
+
+archives:
+  - id: x64-wayland
+    formats: [tar.gz]
+    ids: [linux-x64-wayland]
+    name_template: "{{ .ProjectName }}-{{ .Version }}-x86_64-wayland"
+  - id: x64-x11
+    formats: [tar.gz]
+    ids: [linux-x64-x11]
+    name_template: "{{ .ProjectName }}-{{ .Version }}-x86_64-x11"
+
+nfpms:
+  - id: x64-wayland
+    formats: [deb, rpm]
+    ids: [linux-x64-wayland]
+    file_name_template: "{{- trimsuffix .ConventionalFileName .ConventionalExtension -}}_wayland"
+    package_name: rioterm
+    maintainer: Nikolay Bryskin <nikicat@users.noreply.github.com>
+    dependencies: [libc6 (>= 2.35), libstdc++6 (>= 11)]
+    overrides:
+      rpm:
+        dependencies: [glibc, libstdc++]
+        contents:
+          - src: ./misc/rio.desktop
+            dst: /usr/share/applications/rio.desktop
+          - src: ./misc/r/rio
+            dst: /usr/share/terminfo/r/rio
+          - src: ./misc/logo.svg
+            dst: /usr/share/icons/hicolor/scalable/apps/rio.svg
+    contents:
+      - src: ./misc/rio.desktop
+        dst: /usr/share/applications/rio.desktop
+      - src: ./misc/logo.svg
+        dst: /usr/share/icons/hicolor/scalable/apps/rio.svg
+    section: admin
+    priority: optional
+
+  - id: x64-x11
+    formats: [deb, rpm]
+    ids: [linux-x64-x11]
+    file_name_template: "{{- trimsuffix .ConventionalFileName .ConventionalExtension -}}_x11"
+    package_name: rioterm
+    maintainer: Nikolay Bryskin <nikicat@users.noreply.github.com>
+    dependencies: [libc6 (>= 2.35), libstdc++6 (>= 11)]
+    overrides:
+      rpm:
+        dependencies: [glibc, libstdc++]
+        contents:
+          - src: ./misc/rio.desktop
+            dst: /usr/share/applications/rio.desktop
+          - src: ./misc/r/rio
+            dst: /usr/share/terminfo/r/rio
+          - src: ./misc/logo.svg
+            dst: /usr/share/icons/hicolor/scalable/apps/rio.svg
+    contents:
+      - src: ./misc/rio.desktop
+        dst: /usr/share/applications/rio.desktop
+      - src: ./misc/logo.svg
+        dst: /usr/share/icons/hicolor/scalable/apps/rio.svg
+    section: admin
+    priority: optional
+
+# Per-arch name so the parallel aarch64 runner's checksums don't clobber
+# this one (both append to the same release with replace_existing_artifacts).
+checksum:
+  name_template: checksums-x86_64.txt
+
+changelog:
+  disable: true
+
+release:
+  make_latest: true
+  mode: append
+  prerelease: auto
+  replace_existing_artifacts: true
+  header: |
+    Linux fork build of Rio.
+  footer: >-
+    ---
+    Released by [GoReleaser](https://github.com/goreleaser/goreleaser).
