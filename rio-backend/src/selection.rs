@@ -291,6 +291,20 @@ impl Selection {
         let mut start = self.region.start;
         let mut end = self.region.end;
 
+        // The cell the selection was anchored on (the mouse-press point,
+        // always `region.start`) should stay included regardless of which
+        // side of that cell the press landed on — this matches the behavior
+        // of most terminals, where the symbol you start dragging from is part
+        // of the selection. Force the anchor's side so `range_simple` keeps
+        // its cell, while the moving end (`region.end`) keeps its precise side.
+        if self.ty == SelectionType::Simple {
+            if start.point < end.point {
+                start.side = Side::Left;
+            } else if start.point > end.point {
+                start.side = Side::Right;
+            }
+        }
+
         if start.point > end.point {
             mem::swap(&mut start, &mut end);
         }
@@ -538,11 +552,14 @@ mod tests {
 
     /// Test selection across adjacent lines.
     ///
+    /// The anchored cell (where the drag began) stays included regardless
+    /// of which side of it the press landed on, matching most terminals.
+    ///
     /// 1.  [  ][  ][  ][  ][  ]
     ///     [  ][  ][  ][  ][  ]
     /// 2.  [  ][ B][  ][  ][  ]
     ///     [  ][  ][  ][  ][  ]
-    /// 3.  [  ][ B][XX][XX][XX]
+    /// 3.  [  ][BX][XX][XX][XX]
     ///     [XX][XE][  ][  ][  ]
     #[test]
     fn across_adjacent_lines_upward_final_cell_exclusive() {
@@ -556,7 +573,7 @@ mod tests {
         assert_eq!(
             selection.to_range(&term(2, 5)).unwrap(),
             SelectionRange {
-                start: Pos::new(Line(0), Column(2)),
+                start: Pos::new(Line(0), Column(1)),
                 end: Pos::new(Line(1), Column(1)),
                 is_block: false,
             }
