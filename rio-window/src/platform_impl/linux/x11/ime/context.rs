@@ -171,11 +171,20 @@ struct PreeditCallbacks {
 
 impl PreeditCallbacks {
     pub fn new(client_data: ffi::XPointer) -> PreeditCallbacks {
+        // `preedit_start_callback` returns the max preedit length (`i32`) as the
+        // XIM spec requires, whereas `XIMProcNonnull` returns `()`. Coerce the
+        // function item to a pointer, then reinterpret it to drop the return value
+        // so XIM can store it like the other callbacks.
+        let preedit_start: unsafe extern "C" fn(
+            ffi::XIM,
+            ffi::XPointer,
+            ffi::XPointer,
+        ) -> i32 = preedit_start_callback;
         let start_callback = create_xim_callback(client_data, unsafe {
             mem::transmute::<
-                usize,
-                unsafe extern "C" fn(ffi::XIM, ffi::XPointer, ffi::XPointer),
-            >(preedit_start_callback as usize)
+                unsafe extern "C" fn(ffi::XIM, ffi::XPointer, ffi::XPointer) -> i32,
+                XIMProcNonnull,
+            >(preedit_start)
         });
         let done_callback = create_xim_callback(client_data, preedit_done_callback);
         let caret_callback = create_xim_callback(client_data, preedit_caret_callback);

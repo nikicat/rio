@@ -160,32 +160,6 @@ pub struct SugarloafFonts {
     pub additional_dirs: Option<Vec<String>>,
 }
 
-#[cfg(test)]
-mod toml_tests {
-    use super::*;
-
-    /// User-facing TOML snippet must round-trip into `weight` field as
-    /// `Some(f32)`, regardless of integer vs float spelling and whether
-    /// `style` is also set on the same slot.
-    #[test]
-    fn weight_field_parses_from_toml() {
-        let snippet = r#"
-[regular]
-weight = 300
-style = "Light"
-
-[bold]
-weight = 600
-style = "SemiBold"
-"#;
-        let fonts: SugarloafFonts = toml::from_str(snippet).unwrap();
-        assert_eq!(fonts.regular.weight, Some(300.0));
-        assert_eq!(fonts.regular.style, FontStyle::Named("Light".into()));
-        assert_eq!(fonts.bold.weight, Some(600.0));
-        assert_eq!(fonts.bold.style, FontStyle::Named("SemiBold".into()));
-    }
-}
-
 pub fn parse_unicode(input: &str) -> Option<char> {
     if let Ok(unicode) = u32::from_str_radix(input, 16) {
         if let Some(result) = char::from_u32(unicode) {
@@ -212,5 +186,31 @@ impl Default for SugarloafFonts {
             disable_warnings_not_found: false,
             additional_dirs: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod toml_tests {
+    use super::*;
+
+    /// User-facing TOML snippet must round-trip into `weight` field as
+    /// `Some(f32)`, regardless of integer vs float spelling and whether
+    /// `style` is also set on the same slot.
+    #[test]
+    fn weight_field_parses_from_toml() {
+        let snippet = r#"
+[regular]
+weight = 300
+style = "Light"
+
+[bold]
+weight = 600
+style = "SemiBold"
+"#;
+        let fonts: SugarloafFonts = toml::from_str(snippet).unwrap();
+        assert_eq!(fonts.regular.weight, Some(300.0));
+        assert_eq!(fonts.regular.style, FontStyle::Named("Light".into()));
+        assert_eq!(fonts.bold.weight, Some(600.0));
+        assert_eq!(fonts.bold.style, FontStyle::Named("SemiBold".into()));
     }
 }

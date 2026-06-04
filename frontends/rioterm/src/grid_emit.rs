@@ -2417,6 +2417,10 @@ struct RawGlyph {
     bytes: Vec<u8>,
 }
 
+// The eight parameters are intentional signature parity with the swash
+// variant below; bundling them into a struct would only obscure the
+// platform symmetry that the two backends deliberately share.
+#[allow(clippy::too_many_arguments)]
 #[cfg(target_os = "macos")]
 fn rasterize_glyph_native(
     rasterizer: &mut GridGlyphRasterizer,
@@ -2450,6 +2454,10 @@ fn rasterize_glyph_native(
     })
 }
 
+// The eight parameters are intentional signature parity with the macOS
+// variant above; bundling them into a struct would only obscure the
+// platform symmetry that the two backends deliberately share.
+#[allow(clippy::too_many_arguments)]
 #[cfg(not(target_os = "macos"))]
 fn rasterize_glyph_native(
     rasterizer: &mut GridGlyphRasterizer,
