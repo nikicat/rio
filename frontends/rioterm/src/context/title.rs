@@ -51,7 +51,8 @@ impl ContextManagerTitles {
 }
 
 pub fn create_title_extra_from_context<T: rio_backend::event::EventListener>(
-    context: &Context<T>,
+    // Only read on unix (foreground process lookup); Windows uses a default.
+    #[cfg_attr(not(unix), allow(unused_variables))] context: &Context<T>,
 ) -> Option<ContextTitleExtra> {
     #[cfg(unix)]
     let program =
@@ -76,6 +77,8 @@ pub fn create_title_extra_from_context<T: rio_backend::event::EventListener>(
 /// - Replace home directory prefix with `~`
 /// - If 4+ components deep, show `…/last/three/components`
 fn shorten_path(absolute: &str) -> String {
+    // Used only by the unix home-prefix logic below; Windows uses `absolute`.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let path = Path::new(absolute);
 
     // Replace home prefix with ~

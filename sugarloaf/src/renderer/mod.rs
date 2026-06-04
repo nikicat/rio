@@ -1787,6 +1787,9 @@ impl Renderer {
             // composite on top. Single fullscreen instance, dedicated
             // vertex buffer, reuses the kitty image pipeline + sampler.
             if let Some(bg_tex) = background_image_texture.as_ref() {
+                // Refutable on Linux/macOS (Vulkan/Metal variants); the only
+                // variant when those targets are cfg'd out.
+                #[allow(irrefutable_let_patterns)]
                 if let ImageTexture::Wgpu { view, .. } = &bg_tex.gpu {
                     let instance = ImageInstance {
                         dest_pos: [0.0, 0.0],
@@ -1853,6 +1856,9 @@ impl Renderer {
                         continue;
                     }
                     if let Some(img) = image_textures.get(&draw.image_id) {
+                        // Refutable on Linux/macOS (Vulkan/Metal variants); the
+                        // only variant when those targets are cfg'd out.
+                        #[allow(irrefutable_let_patterns)]
                         if let ImageTexture::Wgpu { view, .. } = &img.gpu {
                             let bg = ctx.device.create_bind_group(
                                 &wgpu::BindGroupDescriptor {
@@ -2011,6 +2017,9 @@ impl Renderer {
                         continue;
                     }
                     if let Some(img) = image_textures.get(&draw.image_id) {
+                        // Refutable on Linux/macOS (Vulkan/Metal variants); the
+                        // only variant when those targets are cfg'd out.
+                        #[allow(irrefutable_let_patterns)]
                         if let ImageTexture::Wgpu { view, .. } = &img.gpu {
                             let bg = ctx.device.create_bind_group(
                                 &wgpu::BindGroupDescriptor {

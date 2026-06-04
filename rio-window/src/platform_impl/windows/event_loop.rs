@@ -660,10 +660,10 @@ fn dur2timeout(dur: Duration) -> u32 {
         .checked_mul(1000)
         .and_then(|ms| ms.checked_add((dur.subsec_nanos() as u64) / 1_000_000))
         .and_then(|ms| {
-            if dur.subsec_nanos() % 1_000_000 > 0 {
-                ms.checked_add(1)
-            } else {
+            if dur.subsec_nanos().is_multiple_of(1_000_000) {
                 Some(ms)
+            } else {
+                ms.checked_add(1)
             }
         })
         .map(|ms| {
@@ -2929,5 +2929,5 @@ unsafe fn confirm_close_native(hwnd: HWND) -> bool {
             MB_YESNO | MB_ICONQUESTION | MB_TASKMODAL,
         )
     };
-    response == IDYES as i32
+    response == IDYES
 }
