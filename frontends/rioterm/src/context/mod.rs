@@ -885,6 +885,24 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.contexts.get(index).is_some_and(|grid| grid.has_bell())
     }
 
+    /// Attach the desktop-notification handle for the pane that rang, so
+    /// focusing it (or closing it) withdraws the notification just as it clears
+    /// the tab-bar dot. Paired with [`Self::mark_bell`] from the same bell.
+    #[inline]
+    pub fn set_bell_notification(
+        &mut self,
+        route_id: usize,
+        handle: rio_notifier::NotificationHandle,
+    ) {
+        if let Some(grid) = self
+            .contexts
+            .iter_mut()
+            .find(|grid| grid.contains_route(route_id))
+        {
+            grid.set_notification_for_route(route_id, handle);
+        }
+    }
+
     /// Focus the current pane: record it as the active route and acknowledge
     /// its bell. Every tab/split switch funnels its `current_route` update
     /// through here, so focusing the exact pane that rang clears its dot
@@ -1426,6 +1444,54 @@ pub mod test {
         // Focusing the flagged tab clears its dot.
         cm.set_current(1);
         assert!(!cm.tab_has_bell(1));
+    }
+
+    /// The desktop notification posted for a bell is withdrawn on the same
+    /// transitions as the tab-bar dot: focusing the pane, a newer bell
+    /// replacing it, and the pane going away (close/quit). Withdrawal is
+    /// observed through a detached handle so no desktop/D-Bus is involved.
+    #[test]
+    fn test_bell_notification_withdrawn_with_dot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let window_id: WindowId = WindowId::from(0);
+        let mut cm =
+            ContextManager::start_with_capacity(5, VoidListener {}, window_id).unwrap();
+        cm.add_context(false, 0);
+        cm.add_context(false, 0);
+
+        let tab1_route = cm.contexts[1].current().route_id;
+        let tab2_route = cm.contexts[2].current().route_id;
+
+        // A handle whose `close` bumps `counter`, so the test can count withdraws.
+        let handle = |counter: &Arc<AtomicUsize>| {
+            let counter = Arc::clone(counter);
+            rio_notifier::NotificationHandle::detached(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let tab1 = Arc::new(AtomicUsize::new(0));
+        let tab2 = Arc::new(AtomicUsize::new(0));
+        cm.set_bell_notification(tab1_route, handle(&tab1));
+        cm.set_bell_notification(tab2_route, handle(&tab2));
+
+        // Focusing tab 1 withdraws its notification and leaves the belled
+        // sibling (tab 2) alone — same per-pane scoping as the dot.
+        cm.set_current(1);
+        assert_eq!(tab1.load(Ordering::SeqCst), 1);
+        assert_eq!(tab2.load(Ordering::SeqCst), 0);
+
+        // A fresh bell on tab 2 replaces and withdraws the previous one.
+        let tab2_again = Arc::new(AtomicUsize::new(0));
+        cm.set_bell_notification(tab2_route, handle(&tab2_again));
+        assert_eq!(tab2.load(Ordering::SeqCst), 1);
+        assert_eq!(tab2_again.load(Ordering::SeqCst), 0);
+
+        // Dropping the manager (as on tab/window close or quit) withdraws
+        // whatever is still pending, and only that.
+        drop(cm);
+        assert_eq!(tab2_again.load(Ordering::SeqCst), 1);
     }
 
     #[test]

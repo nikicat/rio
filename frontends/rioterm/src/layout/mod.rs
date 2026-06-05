@@ -134,6 +134,22 @@ pub struct ContextGridItem<T: EventListener> {
     /// cleared when this exact pane is focused. The tab bar's per-tab bell dot
     /// is the OR of these flags across the tab's panes.
     pub bell_ringing: bool,
+    /// Handle to the desktop notification posted for this pane's most recent
+    /// background bell, if one is still pending. Withdrawn when the pane is
+    /// focused (alongside `bell_ringing`) or when the pane goes away, so the OS
+    /// notification never outlives the bell it announced.
+    notification: Option<rio_notifier::NotificationHandle>,
+}
+
+impl<T: rio_backend::event::EventListener> Drop for ContextGridItem<T> {
+    fn drop(&mut self) {
+        // Closing the pane (or the tab/window, or quitting) should also dismiss
+        // any notification it left on screen. On quit this still runs because
+        // `exiting()` clears the routes before `process::exit`.
+        if let Some(handle) = self.notification.take() {
+            handle.close();
+        }
+    }
 }
 
 impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
@@ -142,6 +158,7 @@ impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
             val: context,
             layout_rect: [0.0; 4],
             bell_ringing: false,
+            notification: None,
         }
     }
 
@@ -307,13 +324,33 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         self.inner.values().any(|item| item.bell_ringing)
     }
 
-    /// Clear the bell flag on the single panel with `route_id`. Called when
-    /// that exact pane is focused, so acknowledging one split doesn't dismiss
-    /// the bell on its siblings.
+    /// Clear the bell flag on the single panel with `route_id`, and withdraw
+    /// any desktop notification it posted. Called when that exact pane is
+    /// focused, so acknowledging one split doesn't dismiss the bell — or the
+    /// notification — on its siblings.
     #[inline]
     pub fn clear_bell_for_route(&mut self, route_id: usize) {
         if let Some(item) = self.get_by_route_id(route_id) {
             item.bell_ringing = false;
+            if let Some(handle) = item.notification.take() {
+                handle.close();
+            }
+        }
+    }
+
+    /// Attach the desktop-notification handle for `route_id`'s latest
+    /// background bell, withdrawing any earlier one still pending on that pane
+    /// so repeated bells don't leave a pile of stale notifications behind.
+    #[inline]
+    pub fn set_notification_for_route(
+        &mut self,
+        route_id: usize,
+        handle: rio_notifier::NotificationHandle,
+    ) {
+        if let Some(item) = self.get_by_route_id(route_id) {
+            if let Some(previous) = item.notification.replace(handle) {
+                previous.close();
+            }
         }
     }
 

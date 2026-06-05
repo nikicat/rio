@@ -419,7 +419,15 @@ impl Application<'_> {
                     window_id,
                 );
             });
-            rio_notifier::send_notification(title, "Terminal bell", Some(on_activate));
+            let handle =
+                rio_notifier::send_notification(title, "Terminal bell", Some(on_activate));
+            // Tie the notification to the pane so focusing or closing it
+            // withdraws the notification, mirroring the tab-bar bell dot.
+            route
+                .window
+                .screen
+                .ctx_mut()
+                .set_bell_notification(route_id, handle);
         }
     }
 
@@ -2026,8 +2034,13 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     // You generally want to treat this as an “do on quit” event.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         // Ensure that all the windows are dropped, so the destructors for
-        // Renderer and contexts ran.
+        // Renderer and contexts ran. Dropping the contexts closes any pending
+        // bell-notification handles, signalling their withdraws.
         self.router.routes.clear();
+
+        // Let those withdraws reach the desktop before `process::exit` kills
+        // the notifier threads; otherwise a bell notification could outlive Rio.
+        rio_notifier::shutdown();
 
         // SAFETY: The clipboard must be dropped before the event loop, so
         // replace it with a safe no-op placeholder.

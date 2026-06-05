@@ -4025,7 +4025,9 @@ dependencies = [
 name = "rio-notifier"
 version = "0.4.6"
 dependencies = [
+ "async-channel",
  "block2 0.5.1",
+ "futures-lite",
  "objc-rs 0.3.1",
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
