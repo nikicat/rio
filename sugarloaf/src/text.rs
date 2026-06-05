@@ -358,6 +358,40 @@ impl Text {
         width_px / self.scale_factor
     }
 
+    /// Vertical ink bounds of `text` under `opts`, in **logical** pixels
+    /// relative to the `y` passed to [`draw`]. Returns `(top, bottom)`:
+    /// the ink spans `[y + top, y + bottom]`. To vertically center the
+    /// ink on `cy`, draw at `cy - (top + bottom) / 2.0`.
+    ///
+    /// Mirrors the glyph placement in [`emit_run`] / the text shader,
+    /// where the ink quad's device-pixel origin is
+    /// `pos + bearings = (y * scale + glyph.y) + bearing_y` and it
+    /// extends down by the rasterized slot height. Rasterizing here
+    /// warms the atlas cache the subsequent `draw` reuses.
+    pub fn measure_v(&mut self, text: &str, opts: &DrawOpts) -> (f32, f32) {
+        let runs = self.shape_runs(text, opts);
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
+        for run in &runs {
+            for glyph in &run.glyphs {
+                let Some((slot, _)) = self.rasterize_slot(run, glyph.id) else {
+                    continue;
+                };
+                if slot.w == 0 || slot.h == 0 {
+                    continue;
+                }
+                let ink_top = glyph.y.max(0.0) + slot.bearing_y as f32;
+                top = top.min(ink_top);
+                bottom = bottom.max(ink_top + slot.h as f32);
+            }
+        }
+        if top > bottom {
+            return (0.0, 0.0);
+        }
+        let scale = self.scale_factor;
+        (top / scale, bottom / scale)
+    }
+
     //  Shape pipeline — shared cache + cfg-gated backend call
 
     /// Resolve `text` into one or more shaped runs, splitting on font
@@ -2294,5 +2328,38 @@ mod tests {
         let segs = itemize_segments(text, by_block);
         assert_eq!(segs.len(), 4);
         assert_eq!(reassemble(text, &segs), text);
+    }
+
+    /// A `Text` backed by the bundled fonts + CPU atlas, so rasterization
+    /// is deterministic for ASCII (no host-installed fallback involved).
+    fn cpu_text() -> super::Text {
+        let mut text = super::Text::new(&crate::font::FontLibrary::default());
+        text.init_cpu();
+        text
+    }
+
+    /// Contract of [`super::Text::measure_v`] for the degenerate case: no
+    /// glyphs to rasterize → a zero-height span, so centering math
+    /// (`cy - (top + bottom) / 2`) degenerates to drawing at `cy`.
+    #[test]
+    fn measure_v_empty_string_is_zero_span() {
+        let mut text = cpu_text();
+        assert_eq!(text.measure_v("", &super::DrawOpts::default()), (0.0, 0.0));
+    }
+
+    /// For a real (bundled, host-independent) glyph the ink span is
+    /// non-empty and ordered — `top < bottom` — which is what the
+    /// centering caller relies on. Asserting *exact* bounds would couple
+    /// the test to font metrics, so we only check the invariant.
+    #[test]
+    fn measure_v_ascii_glyph_has_ordered_nonempty_span() {
+        let mut text = cpu_text();
+        let opts = super::DrawOpts {
+            font_size: 24.0,
+            ..super::DrawOpts::default()
+        };
+        let (top, bottom) = text.measure_v("M", &opts);
+        assert!(bottom > top, "expected ordered span, got ({top}, {bottom})");
+        assert!(bottom - top > 0.0, "expected positive ink height");
     }
 }

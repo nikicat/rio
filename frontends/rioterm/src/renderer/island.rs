@@ -41,16 +41,16 @@ const TITLE_FONT_SIZE: f32 = 12.0;
 const TAB_PADDING_X: f32 = 24.0;
 
 /// Glyph shown at the left of a tab whose grid has a maximized (zoomed)
-/// pane, mirroring Ghostty's tab zoom indicator. This is the Nerd Font
-/// `nf-fa-search` magnifier (U+F002), preferred over the astral emoji
-/// 🔍 (U+1F50D) or a plain BMP symbol like ⌕ (U+2315) for two reasons:
-/// it's monochrome (so it takes the tab text color rather than rendering
-/// as a fixed-color emoji), and it lives in the bundled CascadiaCodeNF
-/// (so it renders without depending on a system fallback font being
-/// installed). The UI text layer does itemize per-codepoint and fall
-/// back via fontconfig now, but a bundled monochrome glyph is the
-/// dependable choice for a UI affordance.
-const ZOOM_INDICATOR: &str = "\u{f002}";
+/// pane. This is ⛶ "Square Four Corners" (U+26F6), a monochrome BMP
+/// symbol that reads as "maximize/fullscreen" rather than the magnifier
+/// metaphor. It takes the tab text color (no emoji presentation) and,
+/// since the UI text layer itemizes per-codepoint with fontconfig
+/// fallback, renders even though it isn't in the bundled CascadiaCodeNF.
+const ZOOM_INDICATOR: &str = "\u{26f6}";
+
+/// Render size for [`ZOOM_INDICATOR`]. Drawn larger than the title text so
+/// the maximize affordance reads clearly at a glance.
+const ZOOM_INDICATOR_FONT_SIZE: f32 = TITLE_FONT_SIZE * 2.0;
 
 /// Inset from the tab's left edge to the zoom indicator.
 const ZOOM_INDICATOR_PADDING_X: f32 = 8.0;
@@ -466,15 +466,25 @@ impl Island {
             let text_y = (ISLAND_HEIGHT / 2.0) - (TITLE_FONT_SIZE / 2.);
             ui.draw(text_x, text_y, &title, &title_opts);
 
-            // Zoom indicator: a magnifier at the tab's left edge when
+            // Zoom indicator: a maximize glyph at the tab's left edge when
             // this tab's grid has a maximized pane (Ghostty-style). Sits
             // in the left padding zone, clear of the centered title.
             if context_manager.grid_is_zoomed(tab_index) {
+                let zoom_opts = DrawOpts {
+                    font_size: ZOOM_INDICATOR_FONT_SIZE,
+                    color: color_u8(text_color),
+                    ..DrawOpts::default()
+                };
+                // Center on the glyph's actual ink midline, not its em
+                // box: the symbol doesn't fill its line box symmetrically,
+                // so font_size/2 would leave it visually high.
+                let (ink_top, ink_bottom) = ui.measure_v(ZOOM_INDICATOR, &zoom_opts);
+                let zoom_y = (ISLAND_HEIGHT / 2.0) - (ink_top + ink_bottom) / 2.0;
                 ui.draw(
                     x_position + ZOOM_INDICATOR_PADDING_X,
-                    text_y,
+                    zoom_y,
                     ZOOM_INDICATOR,
-                    &title_opts,
+                    &zoom_opts,
                 );
             }
 
