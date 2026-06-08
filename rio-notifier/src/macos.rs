@@ -72,7 +72,10 @@ impl Handle {
         unsafe {
             let center = UNUserNotificationCenter::currentNotificationCenter();
             let identifier = NSString::from_str(&self.identifier);
-            let identifiers = NSArray::from_slice(&[&*identifier]);
+            // `NSString`'s mutability (`ImmutableWithMutableSubclass`) isn't
+            // `IsRetainable`, so `NSArray::from_slice` (which needs that bound)
+            // doesn't apply; `from_id_slice` takes the owned `Retained` instead.
+            let identifiers = NSArray::from_id_slice(&[identifier]);
             center.removeDeliveredNotificationsWithIdentifiers(&identifiers);
         }
     }
