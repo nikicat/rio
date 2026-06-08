@@ -6882,7 +6882,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"abcdefghij");
         bytes.extend_from_slice("\u{23ce}".as_bytes()); // ⏎
-        bytes.extend_from_slice(&vec![b' '; 19]);
+        bytes.extend_from_slice(&[b' '; 19]);
         bytes.extend_from_slice(b"\r\x1b[K");
         processor.advance(&mut term, &bytes);
 
