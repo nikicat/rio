@@ -419,8 +419,11 @@ impl Application<'_> {
                     window_id,
                 );
             });
-            let handle =
-                rio_notifier::send_notification(title, "Terminal bell", Some(on_activate));
+            let handle = rio_notifier::send_notification(
+                title,
+                "Terminal bell",
+                Some(on_activate),
+            );
             // Tie the notification to the pane so focusing or closing it
             // withdraws the notification, mirroring the tab-bar bell dot.
             route

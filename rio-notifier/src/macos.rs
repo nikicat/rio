@@ -18,7 +18,10 @@ use std::sync::Once;
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 fn next_identifier() -> String {
-    format!("rio-notification-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "rio-notification-{}",
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// No-op: `Handle::close` withdraws synchronously on macOS, so nothing is in

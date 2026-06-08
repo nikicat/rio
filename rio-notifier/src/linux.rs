@@ -49,9 +49,7 @@ pub(crate) fn notify(
     // Capacity 1: a single `close` is all that can ever be sent (the handle
     // is consumed), and it must never block the UI thread.
     let (cancel_tx, cancel_rx) = async_channel::bounded(1);
-    std::thread::spawn(move || {
-        zbus::block_on(run(title, body, on_activate, cancel_rx))
-    });
+    std::thread::spawn(move || zbus::block_on(run(title, body, on_activate, cancel_rx)));
     Handle { cancel: cancel_tx }
 }
 
@@ -213,8 +211,7 @@ async fn run(
                         }
                     }
                     "NotificationClosed" => {
-                        if let Ok((nid, _reason)) =
-                            msg.body().deserialize::<(u32, u32)>()
+                        if let Ok((nid, _reason)) = msg.body().deserialize::<(u32, u32)>()
                         {
                             if nid == id {
                                 break;
