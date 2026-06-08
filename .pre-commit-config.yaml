@@ -1,0 +1,31 @@
+# Local hooks that mirror the deterministic gates of the `Test` CI workflow,
+# so formatting/lint slips are caught before they break CI.
+#
+# Runs with `prek` (fast, https://github.com/j178/prek) or the classic
+# `pre-commit` framework. One-time setup per clone:
+#
+#     prek install                 # installs both pre-commit and pre-push hooks
+#
+# Bypass in a pinch with `git commit --no-verify` / `git push --no-verify`.
+repos:
+  - repo: local
+    hooks:
+      # The fast gate that actually bites: CI runs `cargo fmt -- --check`.
+      # Instant, so run it on every commit touching Rust.
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --
+        args: ["--check"]
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # CI also runs `cargo clippy --all-targets --all-features -- -D warnings`.
+      # It's a full build — too slow for every commit, so gate it on push.
+      - id: cargo-clippy
+        name: cargo clippy -D warnings
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
