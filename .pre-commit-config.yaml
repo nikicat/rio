@@ -29,3 +29,15 @@ repos:
         types: [rust]
         pass_filenames: false
         stages: [pre-push]
+
+      # CI's `macos-latest` runner is the only job that compiles cfg(macos)
+      # code, so macOS-only breakage lands ~20 min late. The objc2 bindings are
+      # pure Rust, so we can type-check the apple-darwin path from Linux with no
+      # SDK. Skips cleanly if the target toolchain isn't installed.
+      - id: cargo-macos-cross-check
+        name: cargo clippy (macOS / apple-darwin)
+        entry: scripts/macos-cross-check.sh
+        language: script
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
