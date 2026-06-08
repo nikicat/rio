@@ -3364,6 +3364,19 @@ impl<U: EventListener> Handler for Crosswords<U> {
             *cell = blank;
         }
 
+        // Erasing the whole row blanks any continuation it received from the
+        // line above, so a WRAPLINE on that previous line is now dangling.
+        // fish triggers exactly this when flagging a missing final newline: it
+        // pads the line with spaces (autowrapping onto the next row, which sets
+        // WRAPLINE on the content row) and then `\r`+`ESC[K`s the wrapped-to
+        // row before drawing the prompt there. Clearing the stale flag keeps a
+        // triple-click line selection from bleeding into the prompt row.
+        let full_line_erased = left == Column(0) && right == Column(self.grid.columns());
+        if full_line_erased && point.row > self.grid.topmost_line() {
+            let last_col = self.grid.last_column();
+            self.grid[point.row - 1i32][last_col].set_wrapline(false);
+        }
+
         let range = self.grid.cursor.pos.row..=self.grid.cursor.pos.row;
         self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
         if !self.graphics.kitty_placements.is_empty() {
@@ -6832,5 +6845,61 @@ mod tests {
 
         // Cursor must be untouched.
         assert_eq!(cw.grid.cursor.pos, cursor_before);
+    }
+
+    /// Regression: triple-click (line selection) must not bleed into the
+    /// shell prompt after `cat`-ing a file whose last line has no trailing
+    /// newline.
+    ///
+    /// fish marks the omitted final newline by printing a `⏎` glyph and then
+    /// padding the rest of the line with spaces, relying on autowrap to reach
+    /// the next row. That padding overflows the last column, which sets the
+    /// WRAPLINE flag on the content row even though the row is logically a
+    /// complete line. fish immediately `\r`s back and erases that next row
+    /// (`ESC[K`) before drawing the prompt there. The dangling WRAPLINE used
+    /// to survive the erase, so `row_search_right` followed it into the prompt
+    /// row and triple-click selected an extra line.
+    #[test]
+    fn full_line_erase_clears_dangling_wrapline_from_prompt() {
+        use crate::performer::handler::Processor;
+
+        // 20 columns, matching the captured fish session.
+        let cols = 20;
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(cols, 10),
+            CursorShape::Block,
+            VoidListener {},
+            crate::event::WindowId::from(0),
+            0,
+            10,
+        );
+        let mut processor = Processor::default();
+
+        // `cat file-without-newline-at-the-end`: ten chars of content, then
+        // fish's omitted-newline indicator (`⏎`) followed by enough spaces to
+        // overflow the 20-column row (autowrapping onto the next row), then a
+        // carriage return and a clear-to-end-of-line on that next row.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"abcdefghij");
+        bytes.extend_from_slice("\u{23ce}".as_bytes()); // ⏎
+        bytes.extend_from_slice(&vec![b' '; 19]);
+        bytes.extend_from_slice(b"\r\x1b[K");
+        processor.advance(&mut term, &bytes);
+
+        // The content row's WRAPLINE must be gone, so a line selection of row 0
+        // stays on row 0 rather than swallowing the (now erased / soon to be
+        // prompt) row 1.
+        let last_col = term.grid.last_column();
+        assert!(
+            !term.grid[Line(0)][last_col].wrapline(),
+            "padding-induced WRAPLINE must be cleared once the wrapped-to row \
+             is fully erased"
+        );
+        let end = term.row_search_right(Pos::new(Line(0), Column(0)));
+        assert_eq!(
+            end.row,
+            Line(0),
+            "line selection must not extend past the content row"
+        );
     }
 }
