@@ -69,7 +69,7 @@ in
     cargoLock = {
       lockFile = ./Cargo.lock;
       outputHashes = {
-        "sctk-adwaita-0.10.1" = "sha256-t2SSTL2hQQ9WHORpPIbHEt+A2akTjD7CLuS0hsCd9qk=";
+        "sctk-adwaita-0.11.0" = "sha256-5ayaumJuY6NYR1DaUyBt5RNWDMoMpMQnHpKTZxEZ8ug=";
       };
     };
 
