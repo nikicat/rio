@@ -264,7 +264,6 @@ impl HintState {
             let (line_text, byte_to_col) = extract_line_text_with_cols(term, line);
 
             // Find all matches in this line. Onig yields (byte_start, byte_end);
-            // we slice the source ourselves.
             for (start, end) in regex.find_iter(&line_text) {
                 let mut match_text = line_text[start..end].to_string();
 

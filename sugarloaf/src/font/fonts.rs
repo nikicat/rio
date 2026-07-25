@@ -82,14 +82,10 @@ pub struct SugarloafFont {
     pub family: String,
     #[serde(default)]
     pub style: FontStyle,
-    /// `wght` axis override for this slot. Only takes effect when the slot
-    /// is served by the bundled Cascadia Code variable font — i.e. when
-    /// `family` is the default and no system face was matched. Lets users
-    /// dial the regular face below its 400 default (e.g. 350 for a lighter
-    /// look) or pull the bold face below 700. For a non-bundled family,
-    /// pick the weight via `style = "Light"` / `"SemiBold"` instead.
-    #[serde(default)]
-    pub weight: Option<f32>,
+    /// CSS-style weight (100..900). Steers face selection where the
+    /// platform supports it and pins the `wght` axis on variable fonts.
+    #[serde(default = "Option::default")]
+    pub weight: Option<u16>,
 }
 
 impl Default for SugarloafFont {
@@ -208,9 +204,9 @@ weight = 600
 style = "SemiBold"
 "#;
         let fonts: SugarloafFonts = toml::from_str(snippet).unwrap();
-        assert_eq!(fonts.regular.weight, Some(300.0));
+        assert_eq!(fonts.regular.weight, Some(300));
         assert_eq!(fonts.regular.style, FontStyle::Named("Light".into()));
-        assert_eq!(fonts.bold.weight, Some(600.0));
+        assert_eq!(fonts.bold.weight, Some(600));
         assert_eq!(fonts.bold.style, FontStyle::Named("SemiBold".into()));
     }
 }

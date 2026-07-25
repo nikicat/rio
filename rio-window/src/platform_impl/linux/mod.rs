@@ -910,6 +910,11 @@ impl ActiveEventLoop {
     }
 
     #[inline]
+    pub fn cursor_monitor(&self) -> Option<MonitorHandle> {
+        None
+    }
+
+    #[inline]
     pub fn listen_device_events(&self, allowed: DeviceEvents) {
         x11_or_wayland!(match self; Self(evlp) => evlp.listen_device_events(allowed))
     }
@@ -962,6 +967,10 @@ impl ActiveEventLoop {
 
     pub(crate) fn system_theme(&self) -> Option<Theme> {
         x11_or_wayland!(match self; Self(evlp) => evlp.system_theme())
+    }
+
+    pub(crate) fn start_system_theme_monitor(&self) {
+        x11_or_wayland!(match self; Self(evlp) => evlp.start_system_theme_monitor())
     }
 }
 

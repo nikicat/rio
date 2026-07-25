@@ -126,6 +126,7 @@ pub enum HintTag {
     Match,
     Focused,
     HyperlinkHover,
+    Label,
 }
 
 /// Per-row hint interval, closed on both ends. Several `RowHint`s may
@@ -229,6 +230,69 @@ fn pos_eq(a: Pos, b: Pos) -> bool {
     a.row == b.row && a.col == b.col
 }
 
+pub fn push_hint_label_styles(
+    style_table: &mut Vec<Style>,
+    hint_foreground: rio_backend::config::colors::ColorArray,
+    hint_background: rio_backend::config::colors::ColorArray,
+) -> u16 {
+    use rio_backend::config::colors::ColorRgb;
+    let base = style_table.len() as u16;
+    let fg = AnsiColor::Spec(ColorRgb::from_color_arr(hint_foreground));
+    style_table.push(Style {
+        fg,
+        bg: AnsiColor::Spec(ColorRgb::from_color_arr(hint_background)),
+        underline_color: None,
+        flags: StyleFlags::BOLD,
+    });
+    let dimmed = [
+        hint_background[0] * 0.8,
+        hint_background[1] * 0.8,
+        hint_background[2] * 0.8,
+        hint_background[3],
+    ];
+    style_table.push(Style {
+        fg,
+        bg: AnsiColor::Spec(ColorRgb::from_color_arr(dimmed)),
+        underline_color: None,
+        flags: StyleFlags::BOLD,
+    });
+    base
+}
+
+pub fn overlay_hint_labels(
+    row: &Row<Square>,
+    labels: &[crate::context::renderable::HintLabel],
+    y: usize,
+    display_offset: i32,
+    label_style_base: u16,
+    row_hints: &mut Vec<RowHint>,
+) -> Option<Row<Square>> {
+    let line = Line((y as i32) - display_offset);
+    let mut out: Option<Row<Square>> = None;
+    for label in labels {
+        if label.position.row != line {
+            continue;
+        }
+        let col = label.position.col.0;
+        if col >= row.len() {
+            continue;
+        }
+        let target = out.get_or_insert_with(|| row.clone());
+        let mut sq = Square::from_char(label.label);
+        sq.set_style_id(label_style_base + if label.is_first { 0 } else { 1 });
+        target[Column(col)] = sq;
+        row_hints.insert(
+            0,
+            RowHint {
+                lo: col as u16,
+                hi: col as u16,
+                tag: HintTag::Label,
+            },
+        );
+    }
+    out
+}
+
 #[inline]
 fn cell_in_row_hints(row_hints: &[RowHint], col: u16) -> Option<HintTag> {
     // Skip HyperlinkHover for the color paths — it only contributes
@@ -264,6 +328,7 @@ fn cell_fg_hinted(tag: HintTag, renderer: &Renderer) -> [u8; 4] {
             normalized_to_u8(renderer.named_colors.search_focused_match_foreground)
         }
         HintTag::Match => normalized_to_u8(renderer.named_colors.search_match_foreground),
+        HintTag::Label => normalized_to_u8(renderer.named_colors.hint_foreground),
         // Hover doesn't change fg color; defensive — `cell_in_row_hints`
         // already filters this tag out, so this arm shouldn't fire.
         HintTag::HyperlinkHover => [0, 0, 0, 0],
@@ -640,12 +705,7 @@ fn ensure_drawable_sprite(
     )
 }
 
-/// Emit a cursor sprite into the appropriate `fg_rows` slot. Caller
-/// is responsible for clearing the OTHER slot (so a previous-frame
-/// block doesn't linger when this frame draws a hollow, etc.) — see
-/// `grid.clear_cursor()`. `addCursor`
-///.
-pub fn emit_cursor_sprite(
+pub fn cursor_sprite_cell(
     grid: &mut GridRenderer,
     style: CursorRenderStyle,
     col: u16,
@@ -653,15 +713,12 @@ pub fn emit_cursor_sprite(
     color: [u8; 4],
     cell_w: u32,
     cell_h: u32,
-) {
+) -> Option<(bool, CellText)> {
     let sprite = style.sprite();
     let thickness = cursor_thickness(cell_h);
-    let Some(slot) = ensure_cursor_sprite_slot(grid, sprite, cell_w, cell_h, thickness)
-    else {
-        return;
-    };
+    let slot = ensure_cursor_sprite_slot(grid, sprite, cell_w, cell_h, thickness)?;
     if slot.w == 0 || slot.h == 0 {
-        return;
+        return None;
     }
     let cursor_cell = CellText {
         glyph_pos: [slot.x as u32, slot.y as u32],
@@ -677,11 +734,7 @@ pub fn emit_cursor_sprite(
         page: slot.page,
         _pad: 0,
     };
-    if sprite.is_block_slot() {
-        grid.set_block_cursor(&[cursor_cell]);
-    } else {
-        grid.set_non_block_cursor(&[cursor_cell]);
-    }
+    Some((sprite.is_block_slot(), cursor_cell))
 }
 
 /// Underline thickness in physical pixels. fallback
@@ -1062,6 +1115,7 @@ pub fn build_row_bg(
                 HintTag::Match => {
                     match_bg.unwrap_or_else(|| cell_bg(sq, style, renderer, term_colors))
                 }
+                HintTag::Label => cell_bg(sq, style, renderer, term_colors),
                 // `cell_in_row_hints` filters HyperlinkHover out, but
                 // make the match exhaustive so a future caller can't
                 // accidentally hit a panic.
@@ -1158,6 +1212,17 @@ pub struct GridGlyphRasterizer {
     #[cfg(target_os = "macos")]
     handle_cache: FxHashMap<u32, rio_backend::sugarloaf::font::macos::FontHandle>,
 
+    /// Library-wide `(hinting, features)` snapshot, refreshed lazily
+    /// after `clear_font_caches` so shaping and rasterization don't
+    /// take the library lock per run.
+    lib_settings: Option<(
+        bool,
+        std::sync::Arc<Vec<rio_backend::sugarloaf::swash::Setting<u16>>>,
+    )>,
+    /// Per-font `wght` axis pin, mirrored from `FontData.wght_variation`.
+    #[cfg(not(target_os = "macos"))]
+    wght_cache: FxHashMap<u32, Option<f32>>,
+
     // non-macOS: swash wants UTF-8, so keep a `String` scratch.
     #[cfg(not(target_os = "macos"))]
     run_str_scratch: String,
@@ -1174,13 +1239,6 @@ pub struct GridGlyphRasterizer {
             rio_backend::sugarloaf::swash::CacheKey,
         ),
     >,
-    /// `wght` axis value per font_id, populated lazily on first shape /
-    /// rasterize. `None` means the face has no variable-axis override
-    /// (system-loaded fonts), `Some(v)` means a bundled variable face
-    /// with a baked `wght` value (Cascadia Code regular at 400, bold at
-    /// 700, or user-overridden values from `fonts.<slot>.weight`).
-    #[cfg(not(target_os = "macos"))]
-    wght_variation_cache: FxHashMap<u32, Option<f32>>,
 }
 
 impl Default for GridGlyphRasterizer {
@@ -1208,15 +1266,51 @@ impl GridGlyphRasterizer {
             run_str_scratch: String::new(),
             #[cfg(target_os = "macos")]
             handle_cache: FxHashMap::default(),
+            lib_settings: None,
+            #[cfg(not(target_os = "macos"))]
+            wght_cache: FxHashMap::default(),
             #[cfg(not(target_os = "macos"))]
             shape_ctx: rio_backend::sugarloaf::swash::shape::ShapeContext::new(),
             #[cfg(not(target_os = "macos"))]
             scale_ctx: rio_backend::sugarloaf::swash::scale::ScaleContext::new(),
             #[cfg(not(target_os = "macos"))]
             font_data_cache: FxHashMap::default(),
-            #[cfg(not(target_os = "macos"))]
-            wght_variation_cache: FxHashMap::default(),
         }
+    }
+
+    /// Drop every cache keyed by `font_id`; a swapped font library
+    /// reuses the same ids.
+    pub fn clear_font_caches(&mut self) {
+        self.font_resolve.clear();
+        self.ascent_cache.clear();
+        self.synthesis_cache.clear();
+        for bucket in &mut self.run_cache {
+            bucket.clear();
+        }
+        self.lib_settings = None;
+        #[cfg(target_os = "macos")]
+        self.handle_cache.clear();
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.wght_cache.clear();
+            self.font_data_cache.clear();
+        }
+    }
+
+    /// Library-wide `(hinting, features)`, cached until the next
+    /// `clear_font_caches`.
+    fn library_settings(
+        &mut self,
+        font_library: &FontLibrary,
+    ) -> (
+        bool,
+        std::sync::Arc<Vec<rio_backend::sugarloaf::swash::Setting<u16>>>,
+    ) {
+        if self.lib_settings.is_none() {
+            let lib = font_library.inner.read();
+            self.lib_settings = Some((lib.hinting, lib.features.clone()));
+        }
+        self.lib_settings.clone().unwrap()
     }
 
     #[inline]
@@ -1394,10 +1488,20 @@ fn shape_run_ct(
     size_bucket: u16,
     font_library: &FontLibrary,
 ) -> Option<(Vec<ShapedGlyph>, i16)> {
+    let (_, features) = rasterizer.library_settings(font_library);
     let handle = match rasterizer.handle_cache.entry(font_id) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut().clone(),
         std::collections::hash_map::Entry::Vacant(e) => {
             let h = font_library.ct_font(font_id as usize)?;
+            // Configured OpenType features are baked into the cached
+            // CTFont so both shaping and rasterization honor them.
+            let h = if features.is_empty() {
+                h
+            } else {
+                let pairs: Vec<(u32, u16)> =
+                    features.iter().map(|s| (s.tag, s.value)).collect();
+                h.clone().with_features(&pairs).unwrap_or(h)
+            };
             e.insert(h.clone());
             h
         }
@@ -1443,6 +1547,13 @@ fn shape_run_swash(
 ) -> Option<(Vec<ShapedGlyph>, i16)> {
     use rio_backend::sugarloaf::swash::{FontRef, Setting};
 
+    let (_, features) = rasterizer.library_settings(font_library);
+    let wght = *rasterizer.wght_cache.entry(font_id).or_insert_with(|| {
+        let lib = font_library.inner.read();
+        lib.try_get(&(font_id as usize))
+            .and_then(|f| f.wght_variation)
+    });
+
     let font_entry = rasterizer
         .font_data_cache
         .entry(font_id)
@@ -1457,26 +1568,6 @@ fn shape_run_swash(
         key: font_entry.2,
     };
 
-    let wght = *rasterizer
-        .wght_variation_cache
-        .entry(font_id)
-        .or_insert_with(|| {
-            font_library
-                .inner
-                .read()
-                .get(&(font_id as usize))
-                .wght_variation
-        });
-    const WGHT_TAG: rio_backend::sugarloaf::swash::Tag = u32::from_be_bytes(*b"wght");
-    let wght_var = wght.map(|v| Setting {
-        tag: WGHT_TAG,
-        value: v,
-    });
-    let var_slice: &[Setting<f32>] = match wght_var {
-        Some(ref s) => std::slice::from_ref(s),
-        None => &[],
-    };
-
     let ascent_px = *rasterizer
         .ascent_cache
         .entry((font_id, size_bucket))
@@ -1485,17 +1576,23 @@ fn shape_run_swash(
             m.ascent.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
         });
 
+    const WGHT_TAG: u32 = u32::from_be_bytes(*b"wght");
+    let wght_var = wght.map(|v| Setting {
+        tag: WGHT_TAG,
+        value: v,
+    });
     let mut shaper = rasterizer
         .shape_ctx
         .builder(font_ref)
         .size(size_u16 as f32)
+        .features(features.iter().copied())
         // Clear stale coordinates before applying `wght`: swash's
         // `ShaperBuilder::variations()` shares the same never-cleared coord
         // buffer as the scaler, so an unweighted run shaped after a weighted
         // one would inherit the prior `wght` (wrong advances). See the
-        // matching note in `rasterize_glyph_native`.
+        // matching note in the rasterizer below.
         .normalized_coords(core::iter::empty::<i16>())
-        .variations(var_slice.iter().copied())
+        .variations(wght_var.iter().copied())
         .build();
     shaper.add_str(&rasterizer.run_str_scratch);
     let mut glyphs: Vec<ShapedGlyph> = Vec::new();
@@ -1641,21 +1738,6 @@ pub fn build_row_fg(
                 continue;
             };
 
-            // Borrow the primary font's ascent at this size if the
-            // run-shaper has populated it; otherwise approximate at
-            // 80% of the glyph size. The approximation only fires
-            // when no regular text has been laid out at this size yet
-            // — once the user types real text the cache fills and
-            // subsequent registered cells use the precise ascent.
-            let ascent_px = rasterizer
-                .ascent_cache
-                .get(&(
-                    rio_backend::sugarloaf::font::FONT_ID_REGULAR as u32,
-                    size_bucket,
-                ))
-                .copied()
-                .unwrap_or_else(|| (size_u16 as i16).saturating_mul(4) / 5);
-
             // fg colour, mirroring the regular emit loop's
             // selection / hint precedence.
             let style = resolve_style(style_table, sq);
@@ -1677,17 +1759,34 @@ pub fn build_row_fg(
                 }
             };
 
-            if let Some((_, slot, is_color)) = ensure_custom_glyph_by_codepoint(
-                grid,
-                registry,
-                ch as u32,
-                size_bucket,
-                size_u16,
-                cell_h,
-                ascent_px,
-                color,
+            // The render span comes from the registration's declared
+            // `width` (a render hint), NOT the cell layout: a width=2
+            // glyph overflows rightward into the following cell(s) in
+            // pixels while the grid still treats this codepoint as one
+            // logical column. The author is expected to leave that next
+            // cell blank (a trailing space) so the overflow lands on
+            // empty space rather than real content.
+            if let Some((_, slot, is_color, span)) = ensure_custom_glyph_by_codepoint(
+                grid, registry, ch as u32, cell_w_u32, cell_h, color,
             ) {
                 if slot.w != 0 && slot.h != 0 {
+                    // Center the rasterised glyph in its render-span box
+                    // (`span × cell_w` wide, `cell_h` tall). The raster
+                    // is already contained within that box, so centering
+                    // keeps it inside the span regardless of the
+                    // outline's own bearings. `bearings.x` is the offset
+                    // from the cell's left edge; `bearings.y` is measured
+                    // from the cell *bottom* (the shader flips it), so a
+                    // vertically-centred glyph's top sits at
+                    // `(cell_h + glyph_h) / 2`.
+                    let span_w_px =
+                        (cell_w_u32 * span as u32).min(i16::MAX as u32) as i16;
+                    let cell_h_i16 = cell_h.round().clamp(0.0, i16::MAX as f32) as i16;
+                    let glyph_w = slot.w.min(i16::MAX as u16) as i16;
+                    let glyph_h = slot.h.min(i16::MAX as u16) as i16;
+                    let bearing_x = (span_w_px - glyph_w) / 2;
+                    let bearing_y = (cell_h_i16 + glyph_h) / 2;
+
                     // Colour atlas entries are pre-painted (palette
                     // applied during COLR rasterisation), so the
                     // shader multiplies by white. Mono entries take
@@ -1701,7 +1800,7 @@ pub fn build_row_fg(
                     fg_scratch.push(CellText {
                         glyph_pos: [slot.x as u32, slot.y as u32],
                         glyph_size: [slot.w as u32, slot.h as u32],
-                        bearings: [slot.bearing_x, slot.bearing_y],
+                        bearings: [bearing_x, bearing_y],
                         grid_pos: [x as u16, y],
                         color,
                         atlas,
@@ -2346,54 +2445,75 @@ fn ensure_glyph_by_id(
 ///
 /// Returns `None` when the registration was cleared between font
 /// resolution and render, or when rasterisation produces no pixels
-/// (zero-area outline, malformed COLR, etc.).
+/// (zero-area outline, malformed COLR, etc.). On success the 4th tuple
+/// element is the declared render span in cells (1 or 2) so the caller
+/// can center the glyph across its overflow box.
 #[allow(clippy::too_many_arguments)]
 fn ensure_custom_glyph_by_codepoint(
     grid: &mut GridRenderer,
     registry: &rio_backend::sugarloaf::font::glyph_registry::GlyphRegistry,
     codepoint: u32,
-    size_bucket: u16,
-    size_u16: u16,
+    cell_w_u32: u32,
     cell_h: f32,
-    ascent_px: i16,
     foreground_rgba: [u8; 4],
-) -> Option<(GlyphKey, AtlasSlot, bool)> {
+) -> Option<(GlyphKey, AtlasSlot, bool, u16)> {
     use rio_backend::sugarloaf::font::glyph_registry::pack_atlas_glyph_id;
 
-    // Fetch first so we know the registration's version. The lookup
-    // happens under the registry's RwLock read; the entry's payload is
-    // cloned out so the lock drops before we hit tiny-skia.
+    // Fetch first so we know the registration's version + declared
+    // width. The lookup happens under the registry's RwLock read; the
+    // entry's payload is cloned out so the lock drops before tiny-skia.
     let entry = registry.get(codepoint)?;
+
+    // The declared `width` is a render hint: the glyph rasterises into a
+    // `span × cell_w` box and overflows rightward in pixels. The grid
+    // still treats the codepoint as one logical column (no cell was
+    // reserved), so this is purely visual. Clamp to the protocol's 1..=2.
+    let span = (entry.width as u16).clamp(1, 2);
+    let span_w_px = (cell_w_u32 * span as u32).min(u16::MAX as u32) as u16;
+    let cell_h_px = cell_h.round().clamp(0.0, u16::MAX as f32) as u16;
+    let cell_w_px = cell_w_u32.min(u16::MAX as u32) as u16;
+    // The cached slot is now a pure function of (cp, version, upm,
+    // scale) — the bitmap and its raster-intrinsic bearings depend only
+    // on the scale `min(span_w, cell_h)/upm`, and `upm`/version ride in
+    // `glyph_id`. So the key only has to capture the geometry that feeds
+    // the scale: cell_w, cell_h and the 1-vs-2-cell span. Pack them the
+    // same way the cursor sprite key does (span in bit 15, low cell_w
+    // bits in 12..15, cell_h in the low 12) so a line-height-only change
+    // re-keys instead of serving a stale raster. (Within a font family
+    // cell_h pins cell_w, so the 3 low cell_w bits are ample.) The font
+    // ascent is no longer part of the slot — it's applied per-emit — so
+    // it can't alias here.
     let key = GlyphKey {
         font_id: CUSTOM_GLYPH_FONT_ID_U32,
         glyph_id: pack_atlas_glyph_id(codepoint, entry.version),
-        size_bucket,
+        size_bucket: (((span >= 2) as u16) << 15)
+            | ((cell_w_px & 0x7) << 12)
+            | (cell_h_px & 0xFFF),
     };
     if let Some(slot) = grid.lookup_glyph(key) {
-        return Some((key, slot, false));
+        return Some((key, slot, false, span));
     }
     if let Some(slot) = grid.lookup_glyph_color(key) {
-        return Some((key, slot, true));
+        return Some((key, slot, true, span));
     }
 
     let raster = rio_backend::sugarloaf::glyph_protocol::rasterize_payload(
         &entry.payload,
         entry.upm,
-        size_u16,
+        span_w_px,
+        cell_h_px,
         foreground_rgba,
     )?;
 
-    let bearing_y = {
-        let cell_h_i16 = cell_h.round().clamp(0.0, i16::MAX as f32) as i16;
-        cell_h_i16
-            .saturating_sub(ascent_px)
-            .saturating_add(raster.top.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
-    };
+    // Bearings are NOT baked into the cached slot: the caller centers
+    // the glyph in its cell box from `slot.w/h` + the cell metrics at
+    // emit time, so placement always tracks the current geometry and
+    // the slot stays a pure (cp, version, scale) → bitmap mapping.
     let raster_in = RasterizedGlyph {
         width: raster.width,
         height: raster.height,
-        bearing_x: raster.left.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-        bearing_y,
+        bearing_x: 0,
+        bearing_y: 0,
         bytes: &raster.data,
     };
 
@@ -2402,7 +2522,7 @@ fn ensure_custom_glyph_by_codepoint(
     } else {
         grid.insert_glyph(key, raster_in)?
     };
-    Some((key, slot, raster.is_color))
+    Some((key, slot, raster.is_color, span))
 }
 
 /// Platform-agnostic raw-glyph struct. Both backends populate this
@@ -2485,34 +2605,23 @@ fn rasterize_glyph_native(
         key: font_entry.2,
     };
 
-    // Resolve the `wght` axis the same deterministic way shaping does:
-    // populate the per-font_id cache from the font library on a miss.
-    // Rasterization must NOT depend on `shape_run_swash` having run this
-    // frame — when the shaped-run cache hits, shaping is skipped, and a
-    // bare `flatten()` to `None` here would rasterize a bold slot at the
-    // variable font's default 400 instance (the "some glyphs aren't bold"
-    // artifact, varying per window with cache state).
-    let wght = *rasterizer
-        .wght_variation_cache
-        .entry(font_id)
-        .or_insert_with(|| {
-            font_library
-                .inner
-                .read()
-                .get(&(font_id as usize))
-                .wght_variation
-        });
-    const WGHT_TAG: rio_backend::sugarloaf::swash::Tag = u32::from_be_bytes(*b"wght");
-    let wght_var = wght.map(|v| Setting {
+    // Resolve `wght` the same deterministic way shaping does: populate the
+    // per-font_id cache from the library on a miss. Rasterization must NOT
+    // assume `shape_run_swash` ran this frame — when the shaped-run cache
+    // hits, shaping is skipped, and a bare `get()` here would rasterize a
+    // bold slot at the variable font's default 400 instance (the "some
+    // glyphs aren't bold" artifact, varying per window with cache state).
+    let hinting = rasterizer.library_settings(font_library).0;
+    const WGHT_TAG: u32 = u32::from_be_bytes(*b"wght");
+    let wght_var = (*rasterizer.wght_cache.entry(font_id).or_insert_with(|| {
+        let lib = font_library.inner.read();
+        lib.try_get(&(font_id as usize))
+            .and_then(|f| f.wght_variation)
+    }))
+    .map(|v| Setting {
         tag: WGHT_TAG,
         value: v,
     });
-    let var_slice: &[Setting<f32>] = match wght_var {
-        Some(ref s) => std::slice::from_ref(s),
-        None => &[],
-    };
-
-    let hinting = font_library_hinting(rasterizer);
     let mut scaler = rasterizer
         .scale_ctx
         .builder(font_ref)
@@ -2521,15 +2630,13 @@ fn rasterize_glyph_native(
         // Force a clean coordinate slate before applying our `wght`. swash's
         // `variations()` only `resize()`s the shared `ScaleContext` coord
         // buffer and overwrites the axes it's handed — it never clears stale
-        // entries. So a slot with no variation (`wght == None`, empty
-        // `var_slice`) would inherit the previous build's coordinates: an
-        // unweighted italic glyph rasterized right after a bold one would
-        // come out bold. `normalized_coords()` *does* clear, giving a
-        // deterministic default-instance slate that `variations()` then sets
-        // `wght` on. (Far more visible under dim text, which fragments runs
-        // and interleaves more weights through this one shared context.)
+        // entries. So a slot with no variation would inherit the previous
+        // build's coordinates: an unweighted italic glyph rasterized right
+        // after a bold one would come out bold. `normalized_coords()` *does*
+        // clear, giving a deterministic default-instance slate that
+        // `variations()` then sets `wght` on.
         .normalized_coords(core::iter::empty::<i16>())
-        .variations(var_slice.iter().copied())
+        .variations(wght_var.iter().copied())
         .build();
 
     let sources: &[Source] = &[
@@ -2569,16 +2676,75 @@ fn rasterize_glyph_native(
     })
 }
 
-/// Hinting is a library-wide setting. Read once per rasterize; the
-/// RwLock read is cheap. (Caching it locally would require reset
-/// plumbing on config reload.)
-#[cfg(not(target_os = "macos"))]
-#[inline]
-fn font_library_hinting(_r: &GridGlyphRasterizer) -> bool {
-    // TODO: thread through from a cache to avoid the lock per glyph.
-    // For now the lock on swash rasterize is a small fraction of
-    // render time; optimise if profiling flags it.
-    true
+#[cfg(test)]
+mod hint_label_tests {
+    use super::*;
+    use crate::context::renderable::HintLabel;
+
+    fn label(row: i32, col: usize, ch: char, is_first: bool) -> HintLabel {
+        HintLabel {
+            position: Pos::new(Line(row), Column(col)),
+            label: ch,
+            is_first,
+        }
+    }
+
+    #[test]
+    fn push_hint_label_styles_appends_two_bold_badges() {
+        use rio_backend::config::colors::ColorRgb;
+        let mut table = vec![Style::default()];
+        let fg = [0.1, 0.1, 0.1, 1.0];
+        let bg = [1.0, 0.5, 0.0, 1.0];
+        let base = push_hint_label_styles(&mut table, fg, bg);
+        assert_eq!(base, 1);
+        assert_eq!(table.len(), 3);
+        assert!(table[1].flags.contains(StyleFlags::BOLD));
+        assert!(table[2].flags.contains(StyleFlags::BOLD));
+        assert_eq!(table[1].bg, AnsiColor::Spec(ColorRgb::from_color_arr(bg)));
+        assert_eq!(
+            table[2].bg,
+            AnsiColor::Spec(ColorRgb::from_color_arr([0.8, 0.4, 0.0, 1.0]))
+        );
+    }
+
+    #[test]
+    fn overlay_substitutes_label_squares_on_matching_row_only() {
+        let row: Row<Square> = Row::new(10);
+        let labels = [label(3, 2, 'j', true), label(3, 3, 'f', false)];
+        let mut hints = Vec::new();
+
+        assert!(overlay_hint_labels(&row, &labels, 2, 0, 5, &mut hints).is_none());
+        assert!(hints.is_empty());
+
+        let overlaid = overlay_hint_labels(&row, &labels, 3, 0, 5, &mut hints).unwrap();
+        assert_eq!(overlaid[Column(2)].c(), 'j');
+        assert_eq!(overlaid[Column(2)].style_id(), 5);
+        assert_eq!(overlaid[Column(3)].c(), 'f');
+        assert_eq!(overlaid[Column(3)].style_id(), 6);
+        assert_eq!(overlaid[Column(4)].c(), row[Column(4)].c());
+        assert_eq!(hints.len(), 2);
+        assert!(hints.iter().all(|h| h.tag == HintTag::Label));
+        assert_eq!(cell_in_row_hints(&hints, 2), Some(HintTag::Label));
+        assert_eq!(cell_in_row_hints(&hints, 3), Some(HintTag::Label));
+
+        let mut hints = vec![RowHint {
+            lo: 0,
+            hi: 9,
+            tag: HintTag::Match,
+        }];
+        overlay_hint_labels(&row, &labels, 3, 0, 5, &mut hints).unwrap();
+        assert_eq!(cell_in_row_hints(&hints, 2), Some(HintTag::Label));
+        assert_eq!(cell_in_row_hints(&hints, 5), Some(HintTag::Match));
+
+        let mut hints = Vec::new();
+        assert!(overlay_hint_labels(&row, &labels, 3, 2, 5, &mut hints).is_none());
+        assert!(overlay_hint_labels(&row, &labels, 5, 2, 5, &mut hints).is_some());
+
+        let oob = [label(3, 99, 'x', true)];
+        let mut hints = Vec::new();
+        assert!(overlay_hint_labels(&row, &oob, 3, 0, 5, &mut hints).is_none());
+        assert!(hints.is_empty());
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -2642,7 +2808,7 @@ mod resolve_font_cascade_tests {
 /// A bundled variable-font slot (e.g. bold / bold-italic) bakes its
 /// weight into the swash `wght` axis at *rasterize* time via
 /// `wght_variation`. The grid rasterizer feeds that axis through a
-/// per-font_id side cache (`wght_variation_cache`) that is populated by
+/// per-font_id side cache (`wght_cache`) that is populated by
 /// `shape_run_swash`. But shaping is skipped whenever the shaped-run
 /// cache hits (`run_cache_get(..).is_some()`), so a glyph can reach
 /// `rasterize_glyph_native` with the side cache still empty for its
@@ -2704,7 +2870,7 @@ mod wght_rasterize_tests {
         // leave it after `shape_run_swash`. This is the correct reference.
         let mut warm = GridGlyphRasterizer::new();
         warm.font_data_cache.insert(0, font_entry.clone());
-        warm.wght_variation_cache.insert(0, Some(700.0));
+        warm.wght_cache.insert(0, Some(700.0));
         let bold = rasterize_glyph_native(
             &mut warm, 0, glyph_id, size_u16, false, false, false, &lib,
         )
@@ -2714,7 +2880,7 @@ mod wght_rasterize_tests {
         // cache has no entry for this font_id. This is the buggy case.
         let mut cold = GridGlyphRasterizer::new();
         cold.font_data_cache.insert(0, font_entry);
-        // Intentionally leave `wght_variation_cache` empty.
+        // Intentionally leave `wght_cache` empty.
         let cold_glyph = rasterize_glyph_native(
             &mut cold, 0, glyph_id, size_u16, false, false, false, &lib,
         )
@@ -2790,7 +2956,7 @@ mod wght_rasterize_tests {
         // correct default-instance reference.
         let mut clean = GridGlyphRasterizer::new();
         clean.font_data_cache.insert(1, plain_entry.clone());
-        clean.wght_variation_cache.insert(1, None);
+        clean.wght_cache.insert(1, None);
         let plain_ref = rasterize_glyph_native(
             &mut clean, 1, glyph_id, size_u16, false, false, false, &lib,
         )
@@ -2802,9 +2968,9 @@ mod wght_rasterize_tests {
         // the stale 700 coordinate and renders bold.
         let mut shared = GridGlyphRasterizer::new();
         shared.font_data_cache.insert(0, bold_entry);
-        shared.wght_variation_cache.insert(0, Some(700.0));
+        shared.wght_cache.insert(0, Some(700.0));
         shared.font_data_cache.insert(1, plain_entry);
-        shared.wght_variation_cache.insert(1, None);
+        shared.wght_cache.insert(1, None);
         let bold_first = rasterize_glyph_native(
             &mut shared,
             0,

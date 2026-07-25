@@ -110,6 +110,10 @@ pub struct ContextGrid<T: EventListener> {
     pub height: f32,
     pub current: NodeId,
     pub scaled_margin: Margin,
+    // custom_title has priority over the active panel's computed title.
+    pub custom_title: Option<String>,
+    // custom_color is the tab's background override (tab color picker).
+    pub custom_color: Option<[f32; 4]>,
     scale: f32,
     inner: FxHashMap<NodeId, ContextGridItem<T>>,
     pub root: Option<NodeId>,
@@ -262,6 +266,8 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             inner,
             current: panel_node,
             scaled_margin,
+            custom_title: None,
+            custom_color: None,
             scale,
             width,
             height,
@@ -1380,11 +1386,9 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
     pub fn update_scaled_margin(&mut self, scaled_margin: Margin) {
         self.scaled_margin = scaled_margin;
-        // The Taffy root size is `window - scaled_margin`. Changing the
-        // margin without refreshing it leaves the next `compute_layout`
-        // running against a stale available area, so panels keep their
-        // old size (e.g. the tab bar appearing eats into the terminal
-        // height but the PTY never shrinks).
+        // Keep the taffy root size in sync with the new margins,
+        // otherwise panels keep stale sizes until the next window
+        // resize recomputes the available space.
         let _ = self.try_update_size(self.width, self.height);
     }
 

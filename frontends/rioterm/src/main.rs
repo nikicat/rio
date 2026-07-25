@@ -10,6 +10,7 @@ mod bindings;
 mod cli;
 mod constants;
 mod context;
+mod global_hotkey;
 mod grid_emit;
 mod hints;
 mod ime;
