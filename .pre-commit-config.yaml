@@ -42,6 +42,18 @@ repos:
         pass_filenames: false
         stages: [pre-push]
 
+      # Upstream keeps editing `.goreleaser.yaml`, which this fork deleted in
+      # favour of per-arch OSS configs — so those edits reach us as neither a
+      # conflict nor a change, just silence. Compare the Linux build features
+      # against upstream and complain when they drift.
+      - id: goreleaser-drift-check
+        name: goreleaser flags match upstream
+        entry: scripts/goreleaser-drift-check.sh
+        language: script
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+
       # CI's `macos-latest` runner is the only job that compiles cfg(macos)
       # code, so macOS-only breakage lands ~20 min late. The objc2 bindings are
       # pure Rust, so we can type-check the apple-darwin path from Linux with no
