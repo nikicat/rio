@@ -7360,12 +7360,12 @@ mod tests {
         let cols = 4usize;
         let rows = 2usize;
         let mut cells = format!("\x1b[38;2;{r};{g};{b}m");
-        for row in 0..rows {
+        for (row, &row_diacritic) in DIACRITICS.iter().enumerate().take(rows) {
             cells.push_str(&format!("\x1b[{};1H", row + 1));
-            for col in 0..cols {
+            for &col_diacritic in DIACRITICS.iter().take(cols) {
                 cells.push(PLACEHOLDER);
-                cells.push(DIACRITICS[row]);
-                cells.push(DIACRITICS[col]);
+                cells.push(row_diacritic);
+                cells.push(col_diacritic);
             }
         }
         cells.push_str("\x1b[0m");
@@ -7384,7 +7384,7 @@ mod tests {
 
         // Placeholder cells landed with both diacritics.
         let extras = cw.grid.extras_table.clone();
-        for row in 0..rows {
+        for (row, &row_diacritic) in DIACRITICS.iter().enumerate().take(rows) {
             let sq = cw.grid[Line(row as i32)][Column(0)];
             assert_eq!(sq.c(), PLACEHOLDER);
             let zw = sq
@@ -7392,7 +7392,7 @@ mod tests {
                 .and_then(|id| extras.get(id))
                 .map(|e| e.zerowidth.as_slice())
                 .unwrap_or(&[]);
-            assert_eq!(zw, &[DIACRITICS[row], DIACRITICS[0]]);
+            assert_eq!(zw, &[row_diacritic, DIACRITICS[0]]);
         }
 
         // The renderer's geometry for each row's run: with the grid

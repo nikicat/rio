@@ -20,6 +20,18 @@ repos:
         types: [rust]
         pass_filenames: false
 
+      # The pre-push gates below build the working tree, not the commits in
+      # the push, so they can pass on fixes that were never committed. Run
+      # first and fail the push unless the tree already matches what's going
+      # out, which makes their verdict apply to the pushed commit.
+      - id: push-gate-guard
+        name: push gate (tree matches pushed commit)
+        entry: scripts/push-gate-guard.sh
+        language: script
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+
       # CI also runs `cargo clippy --all-targets --all-features -- -D warnings`.
       # It's a full build — too slow for every commit, so gate it on push.
       - id: cargo-clippy

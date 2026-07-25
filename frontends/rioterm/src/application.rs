@@ -262,11 +262,10 @@ fn handle_mouse_release(
             .island
             .as_ref()
             .is_some_and(|i| i.is_dragging())
+        && route.window.screen.handle_tab_drag_release()
     {
-        if route.window.screen.handle_tab_drag_release() {
-            route.request_redraw();
-            return;
-        }
+        route.request_redraw();
+        return;
     }
 
     if route.window.screen.renderer.scrollbar.is_dragging() {
@@ -302,8 +301,8 @@ fn handle_mouse_release(
     // activate a hint sitting under the release point; hints fire on plain
     // clicks only, when no selection exists.
     if route.window.screen.selection_is_empty() {
-        if button == MouseButton::Left && route.window.screen.trigger_hint(clipboard) {
-            return;
+        if button == MouseButton::Left {
+            route.window.screen.trigger_hint(clipboard);
         }
     } else if matches!(button, MouseButton::Left | MouseButton::Right) {
         route
