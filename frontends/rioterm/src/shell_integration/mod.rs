@@ -34,14 +34,19 @@ const FISH_INTEGRATION: &str = include_str!("rio.fish");
 const POWERSHELL_INTEGRATION: &str = include_str!("rio.ps1");
 
 /// Everything shell integration wants applied to one spawn: extra
-/// environment, and for PowerShell a replacement `(program, args)`
-/// command (the program stays `None` when the shell was unconfigured,
-/// so platform default-shell handling such as macOS `login(1)` still
-/// wraps the spawn).
+/// environment, and for PowerShell a replacement command.
 #[derive(Default)]
 pub struct SpawnIntegration {
     pub env: Vec<(String, String)>,
-    pub command: Option<(Option<String>, Vec<String>)>,
+    pub command: Option<SpawnCommand>,
+}
+
+/// A command that replaces the configured shell command for one spawn.
+pub struct SpawnCommand {
+    /// `None` keeps the shell unconfigured, so platform default-shell
+    /// handling such as macOS `login(1)` still wraps the spawn.
+    pub program: Option<String>,
+    pub args: Vec<String>,
 }
 
 /// Resolve the shell once and derive both integration halves from it.
@@ -62,7 +67,11 @@ pub fn prepare(shell_program: Option<&str>, args: &[String]) -> SpawnIntegration
         "RIO_SHELL_INTEGRATION".to_string(),
         dir.to_string_lossy().to_string(),
     ));
-    let command = powershell_command(&shell_name, shell_program, &program, args);
+    let command = powershell_command(
+        &shell_name,
+        powershell_program(shell_program, &program),
+        args,
+    );
     SpawnIntegration { env, command }
 }
 
@@ -137,21 +146,14 @@ fn env_pairs(
     }
 }
 
-/// Rewrites a PowerShell spawn (powershell.exe or pwsh, any platform)
-/// so the shell loads rio's integration script AFTER the user's
-/// profile ran. Only a bare spawn is rewritten: configured args change
-/// what the command line means, so they win over integration. The
-/// returned program keeps an unconfigured shell unconfigured on unix,
-/// so the platform's default-shell handling (macOS `login(1)`) still
-/// wraps the spawn and only the args ride through it; Windows names
-/// the platform default explicitly because its PTY drops args when no
-/// program is given.
+/// Returns the command that makes a bare PowerShell spawn (powershell.exe
+/// or pwsh) load rio's integration script after the user's profile. `None`
+/// for other shells, and for configured `args`, which win over integration.
 fn powershell_command(
     shell_name: &str,
-    configured_program: Option<&str>,
-    resolved_program: &str,
+    program: Option<String>,
     args: &[String],
-) -> Option<(Option<String>, Vec<String>)> {
+) -> Option<SpawnCommand> {
     if shell_name != "powershell" && shell_name != "pwsh" {
         return None;
     }
@@ -159,14 +161,26 @@ fn powershell_command(
         tracing::info!("shell integration skipped: PowerShell spawn has configured args");
         return None;
     }
-    #[cfg(target_os = "windows")]
-    let program = Some(resolved_program.to_string());
-    #[cfg(not(target_os = "windows"))]
-    let program = {
-        let _ = resolved_program;
-        configured_program.map(str::to_string)
-    };
-    Some((program, powershell_args()))
+    Some(SpawnCommand {
+        program,
+        args: powershell_args(),
+    })
+}
+
+/// Returns the program a rewritten PowerShell spawn names. Unix keeps an
+/// unconfigured shell unconfigured, so default-shell handling (macOS
+/// `login(1)`) still wraps the spawn and only the args ride through it.
+#[cfg(not(target_os = "windows"))]
+fn powershell_program(configured: Option<&str>, _resolved: &str) -> Option<String> {
+    configured.map(str::to_string)
+}
+
+/// Returns the program a rewritten PowerShell spawn names. Windows names
+/// the resolved default explicitly: its PTY drops args when no program
+/// is given.
+#[cfg(target_os = "windows")]
+fn powershell_program(_configured: Option<&str>, resolved: &str) -> Option<String> {
+    Some(resolved.to_string())
 }
 
 /// `-NoExit -EncodedCommand <base64 of the UTF-16LE script>`: the
@@ -332,16 +346,25 @@ mod test {
     fn powershell_command_scope() {
         // Configured args always win over integration.
         assert!(
-            powershell_command("pwsh", Some("pwsh"), "pwsh", &["-NoLogo".into()])
+            powershell_command("pwsh", Some("pwsh".into()), &["-NoLogo".into()])
                 .is_none()
         );
         // Non-PowerShell shells are untouched.
-        assert!(powershell_command("zsh", Some("zsh"), "zsh", &[]).is_none());
+        assert!(powershell_command("zsh", Some("zsh".into()), &[]).is_none());
 
-        let (program, args) =
-            powershell_command("pwsh", Some("pwsh"), "pwsh", &[]).unwrap();
-        assert_eq!(program.as_deref(), Some("pwsh"));
-        assert_eq!(args[1], "-EncodedCommand");
+        let command = powershell_command("pwsh", Some("pwsh".into()), &[]).unwrap();
+        assert_eq!(command.program.as_deref(), Some("pwsh"));
+        assert_eq!(command.args[1], "-EncodedCommand");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unconfigured_powershell_stays_unconfigured_on_unix() {
+        assert_eq!(powershell_program(None, "pwsh"), None);
+        assert_eq!(
+            powershell_program(Some("pwsh"), "pwsh").as_deref(),
+            Some("pwsh")
+        );
     }
 
     /// Runs a real zsh against the materialized scripts: the pane

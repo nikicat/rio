@@ -296,7 +296,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             crate::shell_integration::SpawnIntegration::default()
         };
         let (shell_program, shell_args) = match &integration.command {
-            Some((program, args)) => (program.as_deref(), args.as_slice()),
+            Some(command) => (command.program.as_deref(), command.args.as_slice()),
             None => (
                 config.shell.program.as_deref(),
                 config.shell.args.as_slice(),
