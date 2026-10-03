@@ -571,10 +571,6 @@ pub fn create_pty_with_spawn(
         },
     };
 
-    // No program means the caller wants the user's default shell, which is the
-    // only case that goes through `login`. A named program is spawned as given.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-    let uses_default_shell = shell.is_none();
     let shell_program = shell.unwrap_or(&user.shell);
 
     tracing::info!("spawn {:?} {:?}", shell_program, args);
@@ -582,6 +578,10 @@ pub fn create_pty_with_spawn(
     let mut builder = {
         #[cfg(target_os = "macos")]
         {
+            // No program means the caller wants the user's default shell, which
+            // is the only case that goes through `login`. A named program is
+            // spawned as given.
+            let uses_default_shell = shell.is_none();
             if uses_default_shell {
                 // On macOS, use /usr/bin/login to ensure proper login shell environment
                 // This ensures PATH includes directories like /usr/local/bin

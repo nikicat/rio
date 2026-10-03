@@ -74,6 +74,18 @@ enum ReadOutcome {
     Budget,
 }
 
+/// Checks whether a PTY read failed because the child side hung up: on Linux
+/// the master's `read` then fails with `EIO` before the child's exit is seen.
+#[cfg(all(feature = "pty", target_os = "linux"))]
+fn is_child_hangup(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EIO)
+}
+
+#[cfg(all(feature = "pty", not(target_os = "linux")))]
+fn is_child_hangup(_: &io::Error) -> bool {
+    false
+}
+
 #[cfg(feature = "pty")]
 enum ExitReason {
     Shutdown,
@@ -471,17 +483,13 @@ where
                         let hung_up = false;
                         // HUP can accompany unread final output.
                         if event.readiness().is_readable() || hung_up {
-                            if let Err(err) = self.pty_read(state, buf) {
-                                // On Linux, a `read` on the master side of a PTY can fail
-                                // with `EIO` if the client side hangs up.  In that case,
-                                // just loop back round for the inevitable `Exited` event.
-                                #[cfg(target_os = "linux")]
-                                if err.raw_os_error() == Some(libc::EIO) {
-                                    continue;
-                                }
-
-                                return Err(err);
+                            let read = self.pty_read(state, buf);
+                            // A hangup is followed by the `Exited` event; loop
+                            // back round for it instead of failing the reader.
+                            if read.as_ref().is_err_and(is_child_hangup) {
+                                continue;
                             }
+                            read?;
                         }
 
                         if !hung_up && event.readiness().is_writable() {
