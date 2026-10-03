@@ -1,6 +1,8 @@
 pub mod bell;
 pub mod bindings;
-pub mod colors;
+// `colors` and `ConfigError` moved to the `rio-vt` core crate; re-export
+// so `rio_backend::config::{colors, ConfigError}` keep resolving.
+pub use rio_vt::config::{colors, smart_selection, ConfigError};
 pub mod defaults;
 pub mod effects;
 pub mod hints;
@@ -9,7 +11,6 @@ pub mod layout;
 pub mod navigation;
 pub mod platform;
 pub mod renderer;
-pub mod smart_selection;
 pub mod theme;
 pub mod title;
 pub mod window;
@@ -31,22 +32,33 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 use std::{default::Default, fs::File};
+#[cfg(feature = "renderer")]
 use sugarloaf::font::fonts::SugarloafFonts;
 use theme::{AdaptiveColors, AdaptiveTheme, AppearanceTheme, Theme};
 use tracing::warn;
 
-#[derive(Clone, Debug)]
-pub enum ConfigError {
-    ErrLoadingConfig(String),
-    ErrLoadingTheme(String),
-    PathNotFound,
-}
-
+/// `program` of `None` means no program was configured, so the user's default
+/// shell is used (and, on macOS, started as a login shell).
 #[derive(Default, Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Shell {
-    pub program: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_program",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub program: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+/// `program = ""` used to be how you asked for the default shell, so keep
+/// reading it as "nothing configured" rather than trying to spawn it.
+fn deserialize_program<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let program = Option::<String>::deserialize(deserializer)?;
+    Ok(program.filter(|program| !program.is_empty()))
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -98,6 +110,11 @@ pub struct Config {
     pub platform: Platform,
     #[serde(default = "default_use_fork", rename = "use-fork")]
     pub use_fork: bool,
+    /// Inject rio's shell integration into spawned zsh and fish
+    /// shells, so the working directory reaches the terminal (OSC 7)
+    /// with no user setup.
+    #[serde(default = "default_bool_true", rename = "shell-integration")]
+    pub shell_integration: bool,
     #[serde(default = "Keyboard::default")]
     pub keyboard: Keyboard,
     #[serde(default = "Title::default")]
@@ -116,6 +133,7 @@ pub struct Config {
         rename = "adaptive-theme"
     )]
     pub adaptive_theme: Option<AdaptiveTheme>,
+    #[cfg(feature = "renderer")]
     #[serde(default = "SugarloafFonts::default")]
     pub fonts: SugarloafFonts,
     #[serde(default = "default_editor")]
@@ -145,6 +163,11 @@ pub struct Config {
     pub ignore_selection_fg_color: bool,
     #[serde(default = "default_bool_true", rename = "confirm-before-quit")]
     pub confirm_before_quit: bool,
+    /// Unicode grapheme clusters as the unit of cell layout (presets
+    /// DEC private mode 2027). A
+    /// program's DECSET/DECRST still wins at runtime.
+    #[serde(default = "default_bool_true", rename = "grapheme-clustering")]
+    pub grapheme_clustering: bool,
     #[serde(default = "bool::default", rename = "copy-on-select")]
     pub copy_on_select: bool,
     #[serde(
@@ -523,6 +546,7 @@ impl Config {
             if let Some(blur) = window_overwrite.blur {
                 self.window.blur = blur;
             }
+            #[cfg(feature = "renderer")]
             if let Some(bg_image) = &window_overwrite.background_image {
                 self.window.background_image = Some(bg_image.clone());
             }
@@ -652,6 +676,7 @@ impl Default for Config {
             title: Title::default(),
             developer: Developer::default(),
             env_vars: vec![],
+            #[cfg(feature = "renderer")]
             fonts: SugarloafFonts::default(),
             line_height: default_line_height(),
             navigation: Navigation::default(),
@@ -663,10 +688,12 @@ impl Default for Config {
             platform: Platform::default(),
             theme: String::default(),
             use_fork: default_use_fork(),
+            shell_integration: true,
             window: Window::default(),
             working_dir: default_working_dir(),
             ignore_selection_fg_color: false,
             confirm_before_quit: true,
+            grapheme_clustering: true,
             copy_on_select: false,
             hide_cursor_when_typing: false,
             draw_bold_text_with_light_colors: false,
@@ -1162,8 +1189,21 @@ mod tests {
         "#,
         );
 
-        assert_eq!(result.shell.program, "/bin/fish");
+        assert_eq!(result.shell.program.as_deref(), Some("/bin/fish"));
         assert_eq!(result.shell.args, ["--hello"]);
+    }
+
+    #[test]
+    fn test_shell_empty_program_means_default() {
+        let result = create_temporary_config(
+            "change-shell-empty-program",
+            r#"
+            shell = { program = "", args = ["--login"] }
+        "#,
+        );
+
+        assert_eq!(result.shell.program, None);
+        assert_eq!(result.shell.args, ["--login"]);
     }
 
     #[test]
@@ -1175,7 +1215,7 @@ mod tests {
         "#,
         );
 
-        assert_eq!(result.shell.program, "/bin/fish");
+        assert_eq!(result.shell.program.as_deref(), Some("/bin/fish"));
         assert_eq!(result.shell.args, Vec::<&str>::new());
     }
 
@@ -1320,8 +1360,8 @@ mod tests {
         "#,
         );
 
-        // Default is sRGB on every platform — same semantics as ghostty's
-        // `window-colorspace` default. `[window] colorspace` describes how
+        // Default is sRGB on every platform. `[window] colorspace`
+        // describes how
         // input color bytes are *interpreted*, not the surface gamut.
         assert_eq!(result.window.colorspace, window::Colorspace::Srgb);
     }
@@ -1436,7 +1476,7 @@ mod tests {
         result.overwrite_based_on_platform();
 
         // Shell should be completely replaced
-        assert_eq!(result.shell.program, "/bin/zsh");
+        assert_eq!(result.shell.program.as_deref(), Some("/bin/zsh"));
         assert_eq!(result.shell.args, vec!["-l"]);
     }
 
@@ -1567,7 +1607,7 @@ mod tests {
         assert_eq!(result.navigation.mode, navigation::NavigationMode::Tab);
 
         // Shell: completely replaced
-        assert_eq!(result.shell.program, "/bin/zsh");
+        assert_eq!(result.shell.program.as_deref(), Some("/bin/zsh"));
         assert_eq!(result.shell.args, vec!["--login"]);
     }
 
@@ -1588,5 +1628,22 @@ mod tests {
         // Before applying platform overrides, should only have global env vars
         assert_eq!(result.env_vars.len(), 1);
         assert!(result.env_vars.contains(&String::from("GLOBAL=1")));
+    }
+
+    #[test]
+    fn parses_inside_full_config() {
+        use crate::config::Config;
+        let src = r#"
+[smart-selection]
+enabled = true
+
+[[smart-selection.rules]]
+name = "ticket"
+regex = "T-\\d+"
+precision = 80
+"#;
+        let cfg: Config = toml::from_str(src).unwrap();
+        assert!(cfg.smart_selection.enabled);
+        assert_eq!(cfg.smart_selection.rules.len(), 1);
     }
 }

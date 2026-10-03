@@ -1,5 +1,5 @@
 use crate::event::{ClickState, EventPayload, EventProxy, RioEvent, RioEventType};
-use crate::ime::Preedit;
+use crate::ime::{Preedit, PreeditCursor};
 use crate::renderer::utils::update_colors_based_on_theme;
 use crate::router::{routes::RoutePath, Route, Router};
 use crate::scheduler::{Scheduler, TimerId, Topic};
@@ -152,6 +152,18 @@ fn handle_mouse_press(
             return;
         }
 
+        #[cfg(target_os = "macos")]
+        if route.window.screen.allow_manual_dragging {
+            use crate::renderer::island::ISLAND_HEIGHT;
+            let scale = route.window.screen.sugarloaf.scale_factor();
+            if route.window.screen.mouse.y <= (ISLAND_HEIGHT * scale) as f64 {
+                route
+                    .window
+                    .screen
+                    .start_window_drag(&route.window.winit_window);
+            }
+        }
+
         if route.window.screen.handle_scrollbar_click() {
             route.request_redraw();
             return;
@@ -173,10 +185,27 @@ fn handle_mouse_press(
     // Always try panel switching first: if the click targets a different
     // panel, switch to it regardless of mouse mode (e.g. neovim capturing
     // clicks).
+    //
+    // A left click on a highlighted hint bypasses mouse reporting the same
+    // way shift does: the hint's mods are held, so the user is following the
+    // link, not clicking inside the application. The hint itself is latched
+    // for the release handler: re-evaluating there would split a press from
+    // its release when the modifier changes mid-click, and the release must
+    // know which hint the press landed on.
+    let latched = if button == MouseButton::Left {
+        route.window.screen.highlighted_hint().cloned()
+    } else {
+        None
+    };
+    let hint_click = latched.is_some();
+    if button == MouseButton::Left {
+        route.window.screen.mouse.hint_click_latched = latched;
+    }
+
     let switched_pane = route.window.screen.select_current_based_on_mouse();
     let shift_pressed = route.window.screen.modifiers.state().shift_key();
     let mouse_mode = route.window.screen.mouse_mode();
-    match classify_left_press(switched_pane, shift_pressed, mouse_mode) {
+    match classify_left_press(switched_pane, shift_pressed || hint_click, mouse_mode) {
         LeftPressAction::StartSelection => {
             // A click that switches panes must also begin a fresh selection on
             // the newly focused pane, just like a normal click does. Otherwise
@@ -213,10 +242,6 @@ fn handle_mouse_press(
                 .process_mouse_bindings(button, clipboard);
         }
         LeftPressAction::Normal => {
-            if route.window.screen.trigger_hyperlink() {
-                return;
-            }
-
             // Load mouse point, treating message bar and padding as the
             // closest square.
             let display_offset = route.window.screen.display_offset();
@@ -280,7 +305,18 @@ fn handle_mouse_release(
         return;
     }
 
+    // Consume the press handler's latched hint so press and release always
+    // take the same path, even when the hint modifier changed mid-click. The
+    // application never sees one without the other.
+    let latched_hint = if button == MouseButton::Left {
+        route.window.screen.mouse.hint_click_latched.take()
+    } else {
+        None
+    };
+    let hint_click = latched_hint.is_some();
+
     if !route.window.screen.modifiers.state().shift_key()
+        && !hint_click
         && route.window.screen.mouse_mode()
     {
         let code = match button {
@@ -301,8 +337,23 @@ fn handle_mouse_release(
     // activate a hint sitting under the release point; hints fire on plain
     // clicks only, when no selection exists.
     if route.window.screen.selection_is_empty() {
-        if button == MouseButton::Left {
-            route.window.screen.trigger_hint(clipboard);
+        // Only a latched press opens a link, and only when the release lands
+        // on the same span the press did. Mouse mode never turns the drag into
+        // a selection, so without the span check a press on one link released
+        // over another would open the wrong one; and a press the chrome
+        // consumed (which never latches) must not open a highlight it never
+        // touched. The latched match is what executes: a modifier change
+        // mid-click can swap which hint config the same span resolves to.
+        if let Some(latched) = latched_hint {
+            let same_span = route.window.screen.highlighted_hint().is_some_and(|h| {
+                h.text == latched.text && h.start == latched.start && h.end == latched.end
+            });
+            if same_span {
+                route.window.screen.open_latched_hint(latched, clipboard);
+                // Paint the cleared highlight now: an action that steals no
+                // focus (Copy) schedules no frame of its own.
+                route.window.screen.context_manager.request_render();
+            }
         }
     } else if matches!(button, MouseButton::Left | MouseButton::Right) {
         route
@@ -314,6 +365,10 @@ fn handle_mouse_release(
 
 pub struct Application<'a> {
     config: rio_backend::config::Config,
+    /// The title template shows `{{columns}}`/`{{lines}}`, so a resize
+    /// must re-render titles (the only title data with no PTY event;
+    /// everything else arrives via OSC 0/2 and OSC 7).
+    title_tracks_size: bool,
     event_proxy: EventProxy,
     router: Router<'a>,
     scheduler: Scheduler,
@@ -357,6 +412,7 @@ impl Application<'_> {
         rio_notifier::request_authorization();
 
         Application {
+            title_tracks_size: title_tracks_size(&config),
             config,
             event_proxy,
             router,
@@ -389,7 +445,7 @@ impl Application<'_> {
         )
     }
 
-    fn handle_bell(&mut self, window_id: WindowId, route_id: usize) {
+    fn handle_bell(&mut self, window_id: rio_backend::event::WindowId, route_id: usize) {
         tracing::debug!("bell fired: audio={:?}", self.config.bell.audio);
 
         // Playback always runs on the bell worker thread, never the window
@@ -402,18 +458,16 @@ impl Application<'_> {
             return;
         };
 
-        // Per-tab bell dot: flag the (background) pane that rang so the tab bar
-        // marks its tab until that pane is focused. Only repaint when the marker
-        // is newly set — a bell on the focused pane changes nothing. The marker
-        // lives in the tab bar, not in any terminal panel, so without
-        // `mark_dirty` here `render()` would discard the frame as "nothing
-        // changed" and the dot wouldn't appear until the next panel damage
-        // (e.g. the user interacting with an app).
-        if self.config.bell.tab_highlight.is_enabled()
-            && route.window.screen.ctx_mut().mark_bell(route_id)
+        // Per-tab bell dot: flag the background tab that rang. Edge-triggered,
+        // so a BEL flood repaints the strip once.
+        if self.config.bell.tab_indicator
+            && route
+                .window
+                .screen
+                .context_manager
+                .ring_bell(route_id, route.window.is_focused)
         {
-            route.window.screen.mark_dirty();
-            route.request_redraw();
+            route.request_overlay_redraw();
         }
 
         let urgency = self.config.bell.urgency.is_enabled();
@@ -445,7 +499,7 @@ impl Application<'_> {
                 proxy.send_event(
                     RioEventType::Rio(RioEvent::ActivateRoute {
                         route_id,
-                        activation_token: token.map(ActivationToken::from_raw),
+                        activation_token: token,
                     }),
                     window_id,
                 );
@@ -476,6 +530,37 @@ impl Application<'_> {
         let result = event_loop.run_app(self);
         result.map_err(Into::into)
     }
+}
+
+impl Application<'_> {
+    /// One pane's title data changed (OSC 0/2 title carried in
+    /// `raw_title`, OSC 7 directory as `None`): re-render, repaint the
+    /// strip when the displayed text changed, and poke the titlebar.
+    fn handle_title_change(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        route_id: usize,
+        raw_title: Option<&str>,
+    ) {
+        if let Some(route) = self.router.routes.get_mut(&window_id) {
+            if route
+                .window
+                .screen
+                .context_manager
+                .on_title_change(route_id, raw_title)
+            {
+                route.request_overlay_redraw();
+            }
+            route.sync_window_title();
+        }
+    }
+}
+
+/// Whether the title template renders the pane size, the one title
+/// input with no PTY event attached (resizes are locally known).
+fn title_tracks_size(config: &rio_backend::config::Config) -> bool {
+    let template = config.title.content.to_lowercase();
+    template.contains("columns") || template.contains("lines")
 }
 
 impl Application<'_> {
@@ -510,7 +595,7 @@ impl Application<'_> {
     /// centered, sized by the configured percentages, then show it.
     fn show_quake_window(
         &mut self,
-        id: rio_window::window::WindowId,
+        id: rio_backend::event::WindowId,
         event_loop: &ActiveEventLoop,
     ) {
         #[cfg(target_os = "macos")]
@@ -533,9 +618,25 @@ impl Application<'_> {
                 * self.config.window.quake_height_percentage.clamp(0.1, 1.0))
                 as u32;
             let x = mpos.x + (msize.width.saturating_sub(width) / 2) as i32;
-            let _ = window
-                .request_inner_size(rio_window::dpi::PhysicalSize::new(width, height));
-            window.set_outer_position(rio_window::dpi::PhysicalPosition::new(x, mpos.y));
+            #[cfg(target_os = "macos")]
+            {
+                let scale = monitor.scale_factor();
+                let size: rio_window::dpi::LogicalSize<f64> =
+                    rio_window::dpi::PhysicalSize::new(width, height).to_logical(scale);
+                let pos: rio_window::dpi::LogicalPosition<f64> =
+                    rio_window::dpi::PhysicalPosition::new(x, mpos.y).to_logical(scale);
+                let _ = window.request_inner_size(size);
+                window.set_outer_position(pos);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = window.request_inner_size(rio_window::dpi::PhysicalSize::new(
+                    width, height,
+                ));
+                window.set_outer_position(rio_window::dpi::PhysicalPosition::new(
+                    x, mpos.y,
+                ));
+            }
         }
         window.set_visible(true);
         window.focus_window();
@@ -640,19 +741,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             self.setup_quake_hotkey();
         }
 
-        // Schedule title updates every 2s
-        let timer_id = TimerId::new(Topic::UpdateTitles, 0);
-        if !self.scheduler.scheduled(timer_id) {
-            self.scheduler.schedule(
-                EventPayload::new(RioEventType::Rio(RioEvent::UpdateTitles), unsafe {
-                    rio_window::window::WindowId::dummy()
-                }),
-                Duration::from_secs(2),
-                true,
-                timer_id,
-            );
-        }
-
         tracing::info!("Initialisation complete");
     }
 
@@ -664,6 +752,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     // Skip rendering for unfocused windows if configured
                     if self.config.renderer.disable_unfocused_render
                         && !route.window.is_focused
+                        && route.window.focus_seen
                     {
                         return;
                     }
@@ -690,6 +779,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         // Skip rendering for unfocused windows if configured
                         if self.config.renderer.disable_unfocused_render
                             && !route.window.is_focused
+                            && route.window.focus_seen
                         {
                             if route.window.screen.renderer.scrollbar.needs_redraw() {
                                 route.request_redraw();
@@ -748,6 +838,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     if let Some(route) = self.router.routes.get_mut(&window_id) {
                         if self.config.renderer.disable_unfocused_render
                             && !route.window.is_focused
+                            && route.window.focus_seen
                         {
                             return;
                         }
@@ -770,7 +861,21 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             RioEventType::Rio(RioEvent::UpdateGraphics { route_id, queues }) => {
+                use rio_backend::sugarloaf::route_image_key;
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    // A batch the VT thread queued before the user
+                    // closed its tab or split would otherwise land
+                    // under a route nothing will ever release.
+                    if route
+                        .window
+                        .screen
+                        .context_manager
+                        .get_by_route_id(route_id)
+                        .is_none()
+                    {
+                        return;
+                    }
+
                     // Process graphics directly in sugarloaf
                     let sugarloaf = &mut route.window.screen.sugarloaf;
 
@@ -778,19 +883,12 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     // texture store with kitty images, in a disjoint key
                     // namespace.
                     for graphic_data in queues.pending {
-                        let key = crate::renderer::atlas_image_key(graphic_data.id.get());
+                        let key = route_image_key(
+                            route_id,
+                            crate::renderer::atlas_image_key(graphic_data.id.get()),
+                        );
                         sugarloaf.image_data.insert(
                             key,
-                            rio_backend::sugarloaf::GraphicDataEntry::from_graphic_data(
-                                graphic_data,
-                            ),
-                        );
-                    }
-
-                    // Image textures (kitty) → separate store, no clone
-                    for (image_id, graphic_data) in queues.pending_images {
-                        sugarloaf.image_data.insert(
-                            crate::renderer::kitty_image_key(image_id),
                             rio_backend::sugarloaf::GraphicDataEntry::from_graphic_data(
                                 graphic_data,
                             ),
@@ -800,8 +898,23 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     // Removals arrive as final image keys (atlas refs
                     // dropped off scrollback, kitty evictions) and free
                     // both the pixel store and the cached GPU texture.
+                    // They run before the kitty uploads so a batch that
+                    // frees a key and resends it keeps the new pixels.
                     for key in queues.remove_queue {
-                        sugarloaf.remove_image(key);
+                        sugarloaf.remove_image(route_image_key(route_id, key));
+                    }
+
+                    // Image textures (kitty) → separate store, no clone
+                    for (image_id, graphic_data) in queues.pending_images {
+                        sugarloaf.image_data.insert(
+                            route_image_key(
+                                route_id,
+                                crate::renderer::kitty_image_key(image_id),
+                            ),
+                            rio_backend::sugarloaf::GraphicDataEntry::from_graphic_data(
+                                graphic_data,
+                            ),
+                        );
                     }
 
                     // Mark the panel dirty: the renderer skips non-dirty
@@ -860,6 +973,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 };
 
                 self.config = config;
+                self.title_tracks_size = title_tracks_size(&self.config);
 
                 // Dropping the old manager unregisters its hotkeys, so
                 // ToggleQuake binding edits apply without restarting.
@@ -898,6 +1012,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         &self.router.font_library,
                         has_font_updates,
                     );
+                    if !self.config.bell.tab_indicator {
+                        route.window.screen.context_manager.clear_all_bells();
+                    }
                     route.window.configure_window(&self.config);
 
                     if let Some(error) = &config_error {
@@ -914,13 +1031,15 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     // updated config takes effect immediately.
                     route.request_redraw();
                 }
+
+                self.router.update_titles();
             }
             RioEventType::Rio(RioEvent::Quit) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     if self.config.confirm_before_quit {
                         route.confirm_quit();
                     } else {
-                        route.quit();
+                        event_loop.exit();
                     }
                 }
             }
@@ -992,6 +1111,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             event_loop.exit();
                         }
                     } else {
+                        route.window.screen.refresh_titles();
                         let size = route.window.screen.context_manager.len();
                         route.window.screen.resize_top_or_bottom_line(size);
                     }
@@ -1029,7 +1149,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     if let Some(island) = &mut route.window.screen.renderer.island {
                         island.set_progress_report(report);
-                        route.request_redraw();
+                        route.request_overlay_redraw();
                     }
                 }
             }
@@ -1052,7 +1172,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     // the compositor's focus-stealing check; elsewhere
                     // activate_token falls back to focus_window.
                     match activation_token {
-                        Some(token) => route.window.winit_window.activate_token(token),
+                        Some(token) => route
+                            .window
+                            .winit_window
+                            .activate_token(ActivationToken::from_raw(token)),
                         None => route.window.winit_window.focus_window(),
                     }
                     if route.window.screen.ctx_mut().select_tab_by_route(route_id) {
@@ -1121,9 +1244,15 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     );
                 }
             }
-            RioEventType::Rio(RioEvent::Title(title)) => {
+            RioEventType::Rio(RioEvent::Title(route_id, title)) => {
+                self.handle_title_change(window_id, route_id, Some(&title));
+            }
+            RioEventType::Rio(RioEvent::CurrentDirectoryChanged(route_id)) => {
+                self.handle_title_change(window_id, route_id, None);
+            }
+            RioEventType::Rio(RioEvent::SyncWindowTitle) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    route.set_window_title(&title);
+                    route.sync_window_title();
                 }
             }
             RioEventType::Rio(RioEvent::TitleWithSubtitle(title, subtitle)) => {
@@ -1131,9 +1260,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     route.set_window_title(&title);
                     route.set_window_subtitle(&subtitle);
                 }
-            }
-            RioEventType::Rio(RioEvent::UpdateTitles) => {
-                self.router.update_titles();
             }
             RioEventType::Rio(RioEvent::MouseCursorDirty) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
@@ -1162,7 +1288,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     routes, clipboard, ..
                 } = &mut self.router;
                 if let Some(route) = routes.get_mut(&window_id) {
-                    if route.window.is_focused {
+                    // `!focus_seen` mirrors the render gates: a window
+                    // that never received a focus event yet (created in
+                    // the background) must not have OSC 52 silently
+                    // dropped by an is_focused that never initialized.
+                    if route.window.is_focused || !route.window.focus_seen {
                         let text = format(clipboard.get(clipboard_type).as_str());
                         // Route the paste back to the panel that asked for it
                         // (OSC 52 reply), not whichever panel happens to be
@@ -1183,7 +1313,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     routes, clipboard, ..
                 } = &mut self.router;
                 if let Some(route) = routes.get_mut(&window_id) {
-                    if route.window.is_focused {
+                    if route.window.is_focused || !route.window.focus_seen {
                         clipboard.set(clipboard_type, content);
                     }
                 }
@@ -1469,6 +1599,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             return;
         }
 
+        // The event loop keys on rio-window's id; the router keys on the
+        // core's `WindowId`. Convert once at this boundary.
+        let window_id: rio_backend::event::WindowId = window_id.into();
+
         let route = match self.router.routes.get_mut(&window_id) {
             Some(window) => window,
             None => return,
@@ -1505,6 +1639,30 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
             WindowEvent::ModifiersChanged(modifiers) => {
                 route.window.screen.set_modifiers(modifiers);
+
+                // Hint mods (cmd on macOS) are pressed with the pointer
+                // already parked over the link, and `CursorMoved` only
+                // recomputes hints when the pointer crosses a cell
+                // boundary. Without refreshing here the link is never
+                // highlighted, so the click that follows has nothing to
+                // activate. The set half only runs with the pointer inside
+                // the text area (a clamped chrome position must not light
+                // up a link it is not over), but the clear half always
+                // runs: a highlight left behind would outlive its modifier
+                // and hijack the next plain click.
+                if route.path == RoutePath::Terminal
+                    && (if route.window.screen.mouse.inside_text_area {
+                        route.window.screen.update_highlighted_hints()
+                    } else {
+                        route.window.screen.clear_highlighted_hint()
+                    })
+                {
+                    route
+                        .window
+                        .winit_window
+                        .set_cursor(route.window.screen.mouse_cursor_icon());
+                    route.window.screen.context_manager.request_render();
+                }
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
@@ -1529,6 +1687,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     {
                         route.window.screen.mouse.left_button_state =
                             ElementState::Released;
+                        // A release swallowed here must also drop the hint
+                        // latch, or a later chrome-consumed press would
+                        // release against a hint it never landed on.
+                        route.window.screen.mouse.hint_click_latched = None;
                         if let Some(ref mut island) = route.window.screen.renderer.island
                         {
                             island.cancel_drag();
@@ -1702,18 +1864,19 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     route.request_redraw();
                 }
 
-                // Only force the default cursor while the island is
-                // visible — when it's hidden (hide_if_single + single
-                // tab on macOS) the band at the top has no tabs to
-                // hover, and the I-beam from the terminal grid below
-                // should stay during top-edge drags.
+                // The macOS full-size content view keeps this band as custom
+                // window chrome even when hide-if-single hides the island.
+                // Other platforms only reserve it while the island is drawn.
                 use crate::renderer::island::ISLAND_HEIGHT;
                 let scale_factor = route.window.screen.sugarloaf.scale_factor();
                 let island_height_px = (ISLAND_HEIGHT * scale_factor) as f64;
                 let num_tabs = route.window.screen.ctx().len();
                 let zoom = route.window.screen.context_manager.current_pane_zoom();
                 let nav = &route.window.screen.renderer.navigation;
-                if nav.island_visible_with(num_tabs, zoom) && y <= island_height_px {
+                if (nav.chrome_band_reserved(num_tabs)
+                    || nav.island_visible_with(num_tabs, zoom))
+                    && y <= island_height_px
+                {
                     route.window.winit_window.set_cursor(CursorIcon::Default);
                     return;
                 }
@@ -1749,6 +1912,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             delta,
                             &mut route.window.screen.sugarloaf,
                         );
+                    // Dragging a split divider displaces panel origins;
+                    // that is layout, not cursor travel.
+                    route.window.screen.renderer.trail_cursor.snap();
                     let cursor = match border.direction {
                         crate::layout::BorderDirection::Vertical => CursorIcon::ColResize,
                         crate::layout::BorderDirection::Horizontal => {
@@ -1850,35 +2016,14 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     && (route.window.screen.modifiers.state().shift_key()
                         || !route.window.screen.mouse_mode());
 
-                if !is_selecting && route.window.screen.update_highlighted_hints() {
-                    route.window.winit_window.set_cursor(CursorIcon::Pointer);
-                    route.window.screen.context_manager.request_render();
-                } else if !is_selecting {
-                    let cursor_icon =
-                        if !route.window.screen.modifiers.state().shift_key()
-                            && route.window.screen.mouse_mode()
-                        {
-                            CursorIcon::Default
-                        } else {
-                            CursorIcon::Text
-                        };
-
-                    route.window.winit_window.set_cursor(cursor_icon);
-
-                    // In case hyperlink range has cleaned trigger one more render
-                    if route
+                if !is_selecting {
+                    let hint_changed = route.window.screen.update_highlighted_hints();
+                    route
                         .window
-                        .screen
-                        .context_manager
-                        .current()
-                        .has_hyperlink_range()
-                    {
-                        route
-                            .window
-                            .screen
-                            .context_manager
-                            .current_mut()
-                            .set_hyperlink_range(None);
+                        .winit_window
+                        .set_cursor(route.window.screen.mouse_cursor_icon());
+
+                    if hint_changed {
                         route.window.screen.context_manager.request_render();
                     }
                 }
@@ -1892,7 +2037,12 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 } else if cell_changed && route.window.screen.has_mouse_motion_and_drag()
                 {
                     if lmb_pressed {
-                        route.window.screen.mouse_report(32, ElementState::Pressed);
+                        // A latched hint click hides its press and release
+                        // from the application; a drag report leaking out
+                        // mid-click would arrive with no press around it.
+                        if route.window.screen.mouse.hint_click_latched.is_none() {
+                            route.window.screen.mouse_report(32, ElementState::Pressed);
+                        }
                     } else if route.window.screen.mouse.middle_button_state
                         == ElementState::Pressed
                     {
@@ -2002,52 +2152,67 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
 
             WindowEvent::Ime(ime) => {
-                if route.window.screen.renderer.assistant.is_active() {
-                    return;
-                }
-
+                // Modal overlays own keyboard input (`modal_owns_input`
+                // walks the `has_key_wait` roster): while one is up,
+                // composition input must not reach the terminal, but
+                // any stored preedit must still CLEAR: a live
+                // composition would keep painting into the grid behind
+                // the overlay and its key gate would swallow every
+                // plain keystroke after the overlay closes. Search
+                // stays open to IME (commits route into the search
+                // input via `paste`).
                 match ime {
                     Ime::Commit(text) => {
+                        // Text-input overlays (island rename, palette)
+                        // consume commits first, in `has_key_wait`'s
+                        // order; other modals swallow them; only a bare
+                        // terminal receives the text.
+                        if route.overlay_commit_text(&text) {
+                            return;
+                        }
+                        if route.modal_owns_input() {
+                            return;
+                        }
                         // Don't use bracketed paste for single char input.
                         route.window.screen.paste(&text, text.chars().count() > 1);
                     }
                     Ime::Preedit(text, cursor_offset) => {
-                        let preedit = if text.is_empty() {
+                        let preedit = if text.is_empty() || route.modal_owns_input() {
                             None
                         } else {
-                            Some(Preedit::new(text, cursor_offset.map(|offset| offset.0)))
+                            // The platform's `None` means the IME asked
+                            // for a hidden caret (candidate paging),
+                            // NOT end-of-text, which arrives as an
+                            // explicit offset.
+                            let cursor = match cursor_offset {
+                                Some((start, _)) => PreeditCursor::Byte(start),
+                                None => PreeditCursor::Hidden,
+                            };
+                            Some(Preedit::new(text, cursor))
                         };
 
-                        if route.window.screen.context_manager.current().ime.preedit()
-                            != preedit.as_ref()
-                        {
-                            route
-                                .window
-                                .screen
-                                .context_manager
-                                .current_mut()
-                                .ime
-                                .set_preedit(preedit);
+                        // `set_ime_preedit` owns the composing side
+                        // effects (scroll snap, selection, dirty mark)
+                        // and their search-mode exceptions.
+                        if route.window.screen.set_ime_preedit(preedit) {
                             route.request_redraw();
                         }
                     }
                     Ime::Enabled => {
-                        route
-                            .window
-                            .screen
-                            .context_manager
-                            .current_mut()
-                            .ime
-                            .set_enabled(true);
+                        route.window.screen.ime.set_enabled(true);
                     }
                     Ime::Disabled => {
-                        route
-                            .window
-                            .screen
-                            .context_manager
-                            .current_mut()
-                            .ime
-                            .set_enabled(false);
+                        // Disabling wipes any live preedit (input
+                        // source switched mid-composition): mark dirty
+                        // and repaint like the Preedit arm, or the
+                        // block ghosts on screen until unrelated
+                        // damage.
+                        let had_preedit = route.window.screen.ime.preedit().is_some();
+                        route.window.screen.ime.set_enabled(false);
+                        if had_preedit {
+                            route.window.screen.mark_dirty();
+                            route.request_redraw();
+                        }
                     }
                 }
             }
@@ -2062,13 +2227,25 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
                 let focus_changed = route.window.is_focused != focused;
                 route.window.is_focused = focused;
+                route.window.focus_seen = true;
 
-                if focus_changed {
-                    if focused {
-                        // Clear any bell urgency hint now that the user is back; X11
-                        // only clears it on request (Wayland treats `None` as a no-op).
-                        route.window.winit_window.request_user_attention(None);
-                    }
+                if focused && focus_changed {
+                    // Clear any bell urgency hint now that the user is back; X11
+                    // only clears it on request (Wayland treats `None` as a no-op).
+                    route.window.winit_window.request_user_attention(None);
+                }
+                // Focus is a cheap checkpoint to catch backing-scale changes
+                // whose ScaleFactorChanged never arrived (sleep/wake display
+                // reconfiguration).
+                if focused
+                    && route
+                        .window
+                        .screen
+                        .reconcile_scale(&route.window.winit_window)
+                {
+                    route.window.update_vblank_interval();
+                    route.request_redraw();
+                } else if focus_changed {
                     route.request_redraw();
                 }
 
@@ -2082,6 +2259,18 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 // If window was occluded and is now visible, mark for one-time render
                 if was_occluded && !occluded {
                     route.window.needs_render_after_occlusion = true;
+                    // Same checkpoint as focus: the un-occlusion after wake
+                    // is often the first event the window receives.
+                    if route
+                        .window
+                        .screen
+                        .reconcile_scale(&route.window.winit_window)
+                    {
+                        route.window.update_vblank_interval();
+                    }
+                    // An idle terminal produces no PTY traffic to trigger the
+                    // deferred post-occlusion render; request it directly.
+                    route.request_redraw();
                 }
             }
 
@@ -2114,6 +2303,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
 
                 route.window.screen.resize(new_size);
+                if self.title_tracks_size {
+                    route.window.screen.refresh_titles();
+                }
                 route.request_redraw();
             }
 
@@ -2183,6 +2375,16 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     }
                 }
 
+                #[cfg(target_os = "windows")]
+                if !route.window.initial_frame_rendered {
+                    // Keep the native window cloaked until the first complete
+                    // render has been submitted. Uncloaking earlier can expose
+                    // the blank native surface during GPU/PTY startup.
+                    use rio_window::platform::windows::WindowExtWindows;
+                    route.window.winit_window.set_cloaked(false);
+                    route.window.initial_frame_rendered = true;
+                }
+
                 // let duration = start.elapsed();
                 // println!("Time elapsed in render() is: {:?}", duration);
                 // }
@@ -2217,6 +2419,19 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // A confirmed quit can be set from any input path (keys today,
+        // a future mouse or menu handler tomorrow); honoring it here,
+        // once per event batch, keeps the exit independent of which
+        // handler set it. exiting() then drops every route.
+        if self
+            .router
+            .routes
+            .values()
+            .any(|route| route.quit_requested)
+        {
+            event_loop.exit();
+            return;
+        }
         let control_flow = match self.scheduler.update() {
             Some(instant) => ControlFlow::WaitUntil(instant),
             None => ControlFlow::Wait,

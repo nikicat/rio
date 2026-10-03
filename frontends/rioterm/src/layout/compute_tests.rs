@@ -672,8 +672,7 @@ fn zoom_test_dimension() -> ContextDimension {
 /// with `calculate_positions` instead of `apply_taffy_layout`.
 fn zoom_test_grid(n: usize) -> ContextGrid<rio_backend::event::VoidListener> {
     use crate::context::create_mock_context;
-    use rio_backend::event::VoidListener;
-    use rio_window::window::WindowId;
+    use rio_backend::event::{VoidListener, WindowId};
 
     let first =
         create_mock_context(VoidListener {}, WindowId::from(0), 0, zoom_test_dimension());

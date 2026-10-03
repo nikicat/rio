@@ -1417,6 +1417,11 @@ impl InitData<'_> {
 
         win.set_cursor(attributes.cursor);
 
+        // Apply the cloak before making the native window visible. Doing this
+        // in the opposite order can expose one compositor frame before the
+        // cloak takes effect, which is visible as a startup flash.
+        win.set_cloaked(self.attributes.platform_specific.cloaked);
+
         // Set visible before setting the size to ensure the
         // attribute is correctly applied.
         win.set_visible(attributes.visible);
@@ -1464,7 +1469,6 @@ impl InitData<'_> {
         if let Some(corner) = self.attributes.platform_specific.corner_preference {
             win.set_corner_preference(corner);
         }
-        win.set_cloaked(self.attributes.platform_specific.cloaked);
     }
 }
 unsafe fn init(

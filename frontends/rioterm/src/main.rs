@@ -11,7 +11,6 @@ mod cli;
 mod constants;
 mod context;
 mod global_hotkey;
-mod grid_emit;
 mod hints;
 mod ime;
 mod layout;
@@ -24,6 +23,7 @@ mod renderer;
 mod router;
 mod scheduler;
 mod screen;
+mod shell_integration;
 mod watcher;
 
 use clap::Parser;

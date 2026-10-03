@@ -301,8 +301,7 @@ impl FontHandle {
 
     /// Return a derived `FontHandle` with the `wght` variation axis pinned
     /// to `value`. Used to bake the bold weight into Rio's bold/bold-italic
-    /// fallback slots from a single variable-font file (matches ghostty's
-    /// `Face.setVariations` flow in `face/coretext.zig:225-254`).
+    /// fallback slots from a single variable-font file.
     ///
     /// The returned CTFont references the same underlying font data — only
     /// the descriptor's variation attributes change. Returns `None` if
@@ -618,6 +617,18 @@ pub fn find_font_path(
     italic: bool,
     style_name: Option<&str>,
 ) -> Option<PathBuf> {
+    find_font(family, bold, italic, style_name).and_then(|(path, _)| path)
+}
+
+/// Preserve the matched face, including its variable axes and collection
+/// index. The path is `None` for faces without an accessible file URL;
+/// the handle alone is enough to shape and rasterize them.
+pub fn find_font(
+    family: &str,
+    bold: bool,
+    italic: bool,
+    style_name: Option<&str>,
+) -> Option<(Option<PathBuf>, FontHandle)> {
     use core_foundation::array::CFArray;
 
     let family_cf = CFString::new(family);
@@ -672,10 +683,11 @@ pub fn find_font_path(
 
     let desired_styles = derive_desired_styles(bold, italic, style_name);
 
-    candidates
+    let descriptor = candidates
         .iter()
-        .max_by_key(|d| score_candidate(d, bold, italic, &desired_styles))
-        .and_then(|d| d.font_path())
+        .max_by_key(|d| score_candidate(d, bold, italic, &desired_styles))?;
+    let base_font = ct_font::new_from_descriptor(&descriptor, 1.0);
+    Some((descriptor.font_path(), FontHandle { base_font }))
 }
 
 fn derive_desired_styles(
@@ -1416,8 +1428,7 @@ fn build_utf16_to_utf8_map(text: &str) -> Vec<usize> {
 /// `CFStringCreateWithCharactersNoCopy`, and `ShapedGlyph.cluster`
 /// comes back as a UTF-16 code-unit offset. Skips the UTF-8 → UTF-16
 /// conversion inside `CFString::new` AND the UTF-16 → UTF-8 mapping
-/// pass after CoreText. CoreText shaper at
-/// `ghostty/src/font/shaper/coretext.zig:652-680`.
+/// pass after CoreText.
 pub fn shape_text_utf16(
     handle: &FontHandle,
     utf16: &[u16],

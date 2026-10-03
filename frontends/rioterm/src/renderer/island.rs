@@ -41,20 +41,17 @@ const ZOOM_INDICATOR_FONT_SIZE: f32 = TITLE_FONT_SIZE * 2.0;
 /// Inset from the tab's left edge to the zoom indicator.
 const ZOOM_INDICATOR_PADDING_X: f32 = 8.0;
 
-/// Dot shown at the right of a tab that has an unanswered bell (`BEL` rang in
-/// one of its panes while that pane was unfocused), cleared when the pane is
-/// focused. Like [`ZOOM_INDICATOR`] this is a bundled Nerd Font glyph
-/// (`nf-fa-circle`, U+F111): monochrome so it takes the configured bell color,
-/// and bundled in CascadiaCodeNF so it renders without relying on a system
-/// fallback font being present.
-const BELL_INDICATOR: &str = "\u{f111}";
-
-/// Inset from the tab's right edge to the bell dot. Sits in the right padding
-/// zone the centered, ellipsis-truncated title always leaves clear, so the dot
-/// never collides with the title text.
-const BELL_INDICATOR_PADDING_X: f32 = 8.0;
-
 const TITLE_ELLIPSIS: char = '…';
+/// Bell dot for tabs that rang while in the background, and the gap
+/// between it and the tab title. A dot, not a glyph: the UI text layer
+/// resolves one font per run, so a bell glyph exists only where an
+/// emoji font is installed and resolvable, while a dot renders
+/// identically everywhere. Drawn at rect order 1: the tab backgrounds
+/// are submitted at order 0 AFTER the title pass, so a same-order dot
+/// would be painted over and invisible in every multi-tab strip.
+const BELL_DOT_SIZE: f32 = 6.0;
+const BELL_DOT_ORDER: u8 = 1;
+const BELL_GAP: f32 = 4.0;
 const DRAG_THRESHOLD: f32 = 4.0;
 const DRAG_ANIMATION_LENGTH: f32 = 0.15;
 const DRAG_MAX_DT: f32 = 0.05;
@@ -272,6 +269,32 @@ fn island_rect(slot_x: f32, tab_width: f32) -> (f32, f32, f32, f32, f32) {
     (x, y, w, h, radius)
 }
 
+/// How much width a lone tab's title may occupy, in logical pixels.
+///
+/// `window_width` is physical, as `render` receives it, while everything
+/// drawn is logical, the same conversion `tab_strip_layout` makes.
+#[inline]
+fn single_title_budget(window_width: f32, scale_factor: f32, left_margin: f32) -> f32 {
+    ((window_width / scale_factor)
+        - left_margin
+        - ISLAND_MARGIN_RIGHT
+        - TAB_PADDING_X * 2.0)
+        .max(0.0)
+}
+
+/// Where a lone tab's title starts: centred on the strip, but never far
+/// enough left to sit under the traffic lights on macOS. Physical in,
+/// logical out, as above.
+#[inline]
+fn single_title_x(
+    window_width: f32,
+    scale_factor: f32,
+    text_width: f32,
+    left_margin: f32,
+) -> f32 {
+    (((window_width / scale_factor) - text_width) / 2.0).max(left_margin + TAB_PADDING_X)
+}
+
 #[inline]
 fn close_button_center(island_x: f32, island_w: f32) -> Option<f32> {
     (island_w >= CLOSE_MIN_ISLAND_WIDTH)
@@ -339,10 +362,6 @@ pub struct Island {
     pub inactive_text_color: [f32; 4],
     pub active_text_color: [f32; 4],
     pub border_color: [f32; 4],
-    /// Whether to draw the per-tab bell dot (`bell.tab-highlight`).
-    pub tab_highlight: bool,
-    /// Color of the bell dot (`colors.tab-bell`).
-    pub bell_color: [f32; 4],
     /// Current progress bar state
     progress_state: Option<ProgressState>,
     /// Current progress value (0-100)
@@ -382,9 +401,7 @@ impl Island {
         inactive_text_color: [f32; 4],
         active_text_color: [f32; 4],
         border_color: [f32; 4],
-        bell_color: [f32; 4],
         hide_if_single: bool,
-        tab_highlight: bool,
         max_tab_width: f32,
     ) -> Self {
         Self {
@@ -393,8 +410,6 @@ impl Island {
             inactive_text_color,
             active_text_color,
             border_color,
-            tab_highlight,
-            bell_color,
             progress_state: None,
             progress_value: None,
             progress_started_at: None,
@@ -426,14 +441,10 @@ impl Island {
         inactive_text_color: [f32; 4],
         active_text_color: [f32; 4],
         border_color: [f32; 4],
-        bell_color: [f32; 4],
-        tab_highlight: bool,
     ) {
         self.inactive_text_color = inactive_text_color;
         self.active_text_color = active_text_color;
         self.border_color = border_color;
-        self.bell_color = bell_color;
-        self.tab_highlight = tab_highlight;
     }
 
     /// Update the progress bar state from an OSC 9;4 report.
@@ -443,9 +454,7 @@ impl Island {
     /// actively reporting. `progress_started_at` is reset only when the
     /// state actually transitions, so a TUI sending the same `OSC 9;4;3`
     /// every 100 ms (issue #1509) doesn't yank the indeterminate animation
-    /// phase back to zero on every report. Mirrors ghostty's split between
-    /// `glib.timeoutAdd` (heartbeat) and `GtkProgressBar`'s internal pulse
-    /// state (animation).
+    /// phase back to zero on every report.
     pub fn set_progress_report(&mut self, report: ProgressReport) {
         match report.state {
             ProgressState::Remove => {
@@ -666,12 +675,13 @@ impl Island {
         }
     }
 
-    /// Render the progress bar below the island
+    /// Render the progress bar below the tab strip, or at the top when hidden.
     fn render_progress_bar(
         &mut self,
         sugarloaf: &mut Sugarloaf,
         window_width: f32,
         scale_factor: f32,
+        y_position: f32,
     ) {
         // Check for timeout first
         self.check_progress_timeout();
@@ -682,7 +692,6 @@ impl Island {
         };
 
         let width = window_width / scale_factor;
-        let y_position = ISLAND_HEIGHT;
 
         // Determine color based on state
         let color = match state {
@@ -774,8 +783,17 @@ impl Island {
             // tabs.
             self.drag = None;
             self.slide_springs.clear();
-            self.render_progress_bar(sugarloaf, window_width, scale_factor);
+            self.render_progress_bar(sugarloaf, window_width, scale_factor, 0.0);
             return;
+        }
+
+        // A lone tab draws as a centred title with no island, and cannot be
+        // reordered. A drag can only start with two or more tabs, but one can
+        // outlive the second tab (its shell exits mid-drag), and that would
+        // float an island where the title belongs.
+        if num_tabs == 1 {
+            self.drag = None;
+            self.slide_springs.clear();
         }
 
         // A reorder that didn't come from this drag (tab closed via
@@ -849,10 +867,21 @@ impl Island {
                 x_position += tab_width;
                 continue;
             }
-            let max_text_width = (tab_width - TAB_PADDING_X * 2.0).max(0.0);
-            let title = fit_title_to_width(sugarloaf, &raw_title, max_text_width);
+            // A lone tab has nothing to be distinguished from, so it gets no
+            // island at all: just its title, centred across the strip. That
+            // leaves the width of the window to spend on the title, and no
+            // fill to carry a custom colour, which moves to the text.
+            let single = num_tabs == 1;
 
-            let text_color = if is_active {
+            let text_color = if single {
+                match context_manager.custom_color(tab_index) {
+                    Some(mut custom) => {
+                        custom[3] = 1.0;
+                        custom
+                    }
+                    None => self.active_text_color,
+                }
+            } else if is_active {
                 self.active_text_color
             } else {
                 self.inactive_text_color
@@ -863,6 +892,20 @@ impl Island {
                 color: color_u8(text_color),
                 ..DrawOpts::default()
             };
+
+            // The bell mark is its own text run: the UI text layer resolves
+            // a single font per draw from the run's first char, so gluing it
+            // onto the title would shape the whole title in the emoji font.
+            let bell = context_manager.bell(tab_index);
+            let bell_width = if bell { BELL_DOT_SIZE + BELL_GAP } else { 0.0 };
+
+            let max_text_width = if single {
+                single_title_budget(window_width, scale_factor, left_margin) - bell_width
+            } else {
+                tab_width - TAB_PADDING_X * 2.0 - bell_width
+            }
+            .max(0.0);
+            let title = fit_title_to_width(sugarloaf, &raw_title, max_text_width);
 
             // UI text always paints in a final pass above every rect,
             // so the floating tab's opaque background can't occlude
@@ -876,12 +919,41 @@ impl Island {
 
             if !hidden_by_drag {
                 // Measure → centre → draw. Immediate mode, no cached
-                // text_id bookkeeping.
-                let ui = sugarloaf.text_mut();
-                let text_width = ui.measure(&title, &title_opts);
-                let text_x = tab_x + (tab_width - text_width) / 2.0;
+                // text_id bookkeeping. The bell mark and the title are
+                // centred as one group.
+                let text_width =
+                    sugarloaf.text_mut().measure(&title, &title_opts) + bell_width;
+                let text_x = if single {
+                    single_title_x(window_width, scale_factor, text_width, left_margin)
+                } else {
+                    tab_x + (tab_width - text_width) / 2.0
+                };
                 let text_y = (ISLAND_HEIGHT / 2.0) - (TITLE_FONT_SIZE / 2.);
-                ui.draw(text_x, text_y, &title, &title_opts);
+                if bell {
+                    // Centered on the title's lowercase body, not the strip:
+                    // the em box hangs from `text_y` with its optical middle
+                    // about two thirds down, so a strip-centered dot rides
+                    // visibly high next to lowercase titles.
+                    let dot_y =
+                        text_y + TITLE_FONT_SIZE * (2.0 / 3.0) - BELL_DOT_SIZE / 2.0;
+                    sugarloaf.rounded_rect(
+                        None,
+                        text_x,
+                        dot_y,
+                        BELL_DOT_SIZE,
+                        BELL_DOT_SIZE,
+                        text_color,
+                        0.0,
+                        BELL_DOT_SIZE / 2.0,
+                        BELL_DOT_ORDER,
+                    );
+                }
+                sugarloaf.text_mut().draw(
+                    text_x + bell_width,
+                    text_y,
+                    &title,
+                    &title_opts,
+                );
 
                 // Zoom indicator: a maximize glyph at the tab's left edge when
                 // this tab's grid has a maximized pane. Sits in the left
@@ -892,6 +964,7 @@ impl Island {
                         color: color_u8(text_color),
                         ..DrawOpts::default()
                     };
+                    let ui = sugarloaf.text_mut();
                     // Center on the glyph's actual ink midline, not its em
                     // box: the symbol doesn't fill its line box symmetrically,
                     // so font_size/2 would leave it visually high.
@@ -904,25 +977,12 @@ impl Island {
                         &zoom_opts,
                     );
                 }
+            }
 
-                // Bell dot: right-aligned in the tab's right padding (mirroring
-                // the left zoom glyph) so it never collides with the centered,
-                // possibly ellipsis-truncated title. Right-aligned because its
-                // own advance varies with the font.
-                if self.tab_highlight && context_manager.tab_has_bell(tab_index) {
-                    let bell_opts = DrawOpts {
-                        font_size: TITLE_FONT_SIZE,
-                        color: color_u8(self.bell_color),
-                        ..DrawOpts::default()
-                    };
-                    let dot_width = ui.measure(BELL_INDICATOR, &bell_opts);
-                    ui.draw(
-                        tab_x + tab_width - BELL_INDICATOR_PADDING_X - dot_width,
-                        text_y,
-                        BELL_INDICATOR,
-                        &bell_opts,
-                    );
-                }
+            // Nothing is drawn behind a lone title.
+            if single {
+                x_position += tab_width;
+                continue;
             }
 
             // Rounded island for this tab. A custom color (picker /
@@ -1062,7 +1122,7 @@ impl Island {
         }
 
         // Render the progress bar below the island
-        self.render_progress_bar(sugarloaf, window_width, scale_factor);
+        self.render_progress_bar(sugarloaf, window_width, scale_factor, ISLAND_HEIGHT);
     }
 
     /// Toggle the color picker for a given tab index
@@ -1115,20 +1175,20 @@ impl Island {
 
     /// Handle keyboard input while the color picker (with rename field) is open.
     /// Returns true if input was consumed.
+    /// Handle one key event for the rename input. The caller
+    /// (`has_key_wait`'s `Modal::IslandRename` arm) already verified
+    /// the picker is open via `active_modal` and consumes the event
+    /// unconditionally, so there is nothing to return.
     pub fn handle_rename_input(
         &mut self,
         key_event: &rio_window::event::KeyEvent,
         context_manager: &mut ContextManager<EventProxy>,
-    ) -> bool {
+    ) {
         use rio_window::event::ElementState;
         use rio_window::keyboard::{Key, NamedKey};
 
-        if self.color_picker_tab.is_none() {
-            return false;
-        }
-
         if key_event.state != ElementState::Pressed {
-            return true; // consume release events too
+            return; // consume release events too
         }
 
         match &key_event.logical_key {
@@ -1147,14 +1207,23 @@ impl Island {
             }
             _ => {
                 if let Some(text) = key_event.text.as_ref() {
-                    let s = text.as_str();
-                    if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
-                        self.rename_input.push_str(s);
-                        self.rename_caret_time = Instant::now();
-                    }
+                    self.append_rename_text(text.as_str());
                 }
             }
         }
+    }
+
+    /// Append committed or typed text to the rename input, applying
+    /// the shared overlay input policy (`is_printable_text`) so the
+    /// key path and the IME commit path can never drift. Returns
+    /// whether text was actually appended (same contract as
+    /// `CommandPalette::append_query`).
+    pub fn append_rename_text(&mut self, text: &str) -> bool {
+        if self.color_picker_tab.is_none() || !crate::renderer::is_printable_text(text) {
+            return false;
+        }
+        self.rename_input.push_str(text);
+        self.rename_caret_time = Instant::now();
         true
     }
 
@@ -1444,32 +1513,14 @@ impl Island {
         self.color_picker_tab.is_some()
     }
 
-    /// Get the title text for a specific tab index
+    /// Get the title text for a specific tab index: the one displayed
+    /// chain, shared with the native titlebar.
     fn get_title_for_tab(
         &self,
         context_manager: &ContextManager<EventProxy>,
         tab_index: usize,
     ) -> String {
-        // Custom user-set title takes priority
-        if let Some(custom) = context_manager.custom_title(tab_index) {
-            return custom.to_string();
-        }
-
-        if let Some(context_title) = context_manager.title(tab_index) {
-            if !context_title.content.is_empty() {
-                return context_title.content.clone();
-            }
-
-            // Fallback to program name if title is empty
-            if let Some(ref extra) = context_title.extra {
-                if !extra.program.is_empty() {
-                    return extra.program.clone();
-                }
-            }
-        }
-
-        // Default fallback - show tab number
-        String::from("~")
+        context_manager.displayed_title_for_tab(tab_index)
     }
 }
 
@@ -1494,6 +1545,60 @@ mod tests {
             assert!(CLOSE_MARGIN_RIGHT + CLOSE_HIT_HALF_WIDTH < CLOSE_MIN_ISLAND_WIDTH);
             assert!(CLOSE_HOVER_HALF * 2.0 <= ISLAND_HEIGHT - TAB_INSET_Y * 2.0);
         }
+    }
+
+    /// The regression that shipped: `window_width` is physical while draws
+    /// are logical, so centring on it put the title off the right edge of a
+    /// 2x display and nothing appeared at all.
+    #[test]
+    fn single_title_is_centred_in_logical_pixels() {
+        // 1600 physical at 2x is an 800pt strip, so a 100pt title starts at
+        // 350, not at 750 (which would be centred on the physical width and
+        // sit past the right edge).
+        let x = single_title_x(1600.0, 2.0, 100.0, 0.0);
+        assert_eq!(x, 350.0);
+        assert!(x + 100.0 <= 800.0, "title must stay on screen: {x}");
+
+        // At 1x the two agree, which is why this only showed up on retina.
+        assert_eq!(single_title_x(800.0, 1.0, 100.0, 0.0), 350.0);
+    }
+
+    #[test]
+    fn single_title_never_reaches_under_the_traffic_lights() {
+        let margin = 76.0;
+        // A title wider than the strip would centre at a negative x.
+        let x = single_title_x(1600.0, 2.0, 900.0, margin);
+        assert_eq!(x, margin + TAB_PADDING_X);
+    }
+
+    #[test]
+    fn single_title_budget_leaves_both_margins() {
+        // 800pt strip, no left margin: full width less the right margin and
+        // the padding on each side.
+        assert_eq!(
+            single_title_budget(1600.0, 2.0, 0.0),
+            800.0 - ISLAND_MARGIN_RIGHT - TAB_PADDING_X * 2.0
+        );
+        // The macOS left margin comes off the top of that.
+        assert_eq!(
+            single_title_budget(1600.0, 2.0, 76.0),
+            800.0 - 76.0 - ISLAND_MARGIN_RIGHT - TAB_PADDING_X * 2.0
+        );
+        // A window too narrow to hold any text yields no budget, not a
+        // negative one that would underflow the truncation.
+        assert_eq!(single_title_budget(100.0, 2.0, 76.0), 0.0);
+    }
+
+    /// A lone title gets far more room than a tab slot would give it, which
+    /// is the point of dropping the island.
+    #[test]
+    fn single_title_budget_beats_a_tab_slot() {
+        let slot = tab_strip_layout(1600.0, 2.0, 1, 240.0).tab_width;
+        let slot_budget = (slot - TAB_PADDING_X * 2.0).max(0.0);
+        assert!(
+            single_title_budget(1600.0, 2.0, 0.0) > slot_budget,
+            "expected more than a slot's {slot_budget}"
+        );
     }
 
     #[test]
@@ -1556,23 +1661,12 @@ mod tests {
         let active_color = [0.9, 0.9, 0.9, 1.0];
 
         let border_color = [0.7, 0.7, 0.7, 1.0];
-        let bell_color = [1.0, 0.7, 0.1, 1.0];
-        let island = Island::new(
-            inactive_color,
-            active_color,
-            border_color,
-            bell_color,
-            true,
-            true,
-            240.0,
-        );
+        let island = Island::new(inactive_color, active_color, border_color, true, 240.0);
 
         assert_eq!(island.inactive_text_color, inactive_color);
         assert_eq!(island.active_text_color, active_color);
         assert_eq!(island.border_color, border_color);
-        assert_eq!(island.bell_color, bell_color);
         assert!(island.hide_if_single);
-        assert!(island.tab_highlight);
     }
 
     #[test]
@@ -1581,9 +1675,7 @@ mod tests {
             [0.8, 0.8, 0.8, 1.0],
             [1.0, 1.0, 1.0, 1.0],
             [0.8, 0.8, 0.8, 1.0],
-            [1.0, 0.7, 0.1, 1.0],
             false,
-            true,
             240.0,
         );
         assert_eq!(island.height(), ISLAND_HEIGHT);
@@ -1594,9 +1686,7 @@ mod tests {
             [0.5, 0.5, 0.5, 1.0],
             [0.9, 0.9, 0.9, 1.0],
             [0.7, 0.7, 0.7, 1.0],
-            [1.0, 0.7, 0.1, 1.0],
             false,
-            true,
             240.0,
         )
     }
